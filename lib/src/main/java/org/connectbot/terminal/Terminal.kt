@@ -48,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,6 +78,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.AnnotatedString
@@ -84,9 +86,11 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Gesture type for unified gesture handling state machine.
@@ -95,6 +99,7 @@ private enum class GestureType {
     Undetermined,
     Scroll,
     Selection,
+    HorizontalSwipe,
     Zoom,
     HandleDrag
 }
@@ -491,6 +496,8 @@ fun TerminalWithAccessibility(
     val maxScroll = remember(screenState.snapshot.scrollback.size, baseCharHeight) {
         screenState.snapshot.scrollback.size * baseCharHeight
     }
+    // Ensure long-lived gesture coroutines always see the latest max scroll.
+    val maxScrollPx by rememberUpdatedState(maxScroll)
 
     // Selection manager
     val selectionManager = remember(terminalEmulator) {
@@ -578,6 +585,7 @@ fun TerminalWithAccessibility(
         }
     }
     val viewConfiguration = LocalViewConfiguration.current
+    val hostView = LocalView.current
 
     var availableWidth by remember { mutableStateOf(0) }
     var availableHeight by remember { mutableStateOf(0) }
@@ -712,12 +720,16 @@ fun TerminalWithAccessibility(
             } else {
                 Modifier.fillMaxSize()
             }).pointerInput(terminalEmulator, baseCharHeight) {
-                val touchSlopSquared =
-                    viewConfiguration.touchSlop * viewConfiguration.touchSlop
-                coroutineScope {
-                    awaitEachGesture {
+                val touchSlopSquared = viewConfiguration.touchSlop * viewConfiguration.touchSlop
+                val stationaryThresholdPx = viewConfiguration.touchSlop / 3f
+                val stationaryThresholdSquared = stationaryThresholdPx * stationaryThresholdPx
+                    kotlinx.coroutines.coroutineScope {
+                        awaitEachGesture {
                         var gestureType: GestureType = GestureType.Undetermined
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        val downHostViewLocation = IntArray(2)
+                        hostView.getLocationInWindow(downHostViewLocation)
+                        val currentHostViewLocation = IntArray(2)
 
                         // 1. Check if touching a selection handle first
                         if (selectionManager.mode != SelectionMode.NONE && !selectionManager.isSelecting) {
@@ -766,33 +778,7 @@ fun TerminalWithAccessibility(
                             }
                         }
 
-                        // 2. Start long press detection for selection
-                        // Only start selection if no selection is already active
-                        var longPressDetected = false
-                        val longPressJob = launch {
-                            delay(viewConfiguration.longPressTimeoutMillis)
-                            if (gestureType == GestureType.Undetermined &&
-                                selectionManager.mode == SelectionMode.NONE
-                            ) {
-                                longPressDetected = true
-                                gestureType = GestureType.Selection
-
-                                // Start selection
-                                val col = (down.position.x / baseCharWidth).toInt()
-                                    .coerceIn(0, screenState.snapshot.cols - 1)
-                                val row = (down.position.y / baseCharHeight).toInt()
-                                    .coerceIn(0, screenState.snapshot.rows - 1)
-                                selectionManager.startSelection(
-                                    row,
-                                    col,
-                                    SelectionMode.BLOCK
-                                )
-                                showMagnifier = true
-                                magnifierPosition = down.position
-                            }
-                        }
-
-                        // 3. Check for multi-touch (zoom)
+                        // 2. Check for multi-touch (zoom)
                         val secondPointer = withTimeoutOrNull(
                             WAIT_FOR_SECOND_TOUCH_MS
                         ) {
@@ -800,7 +786,6 @@ fun TerminalWithAccessibility(
                         }
 
                         if (secondPointer != null) {
-                            longPressJob.cancel()
                             gestureType = GestureType.Zoom
 
                             // Handle zoom using Compose's built-in gesture calculations
@@ -843,6 +828,38 @@ fun TerminalWithAccessibility(
                             return@awaitEachGesture
                         }
 
+                        // 3. Start long press detection for selection (stationary only).
+                        var longPressDetected = false
+                        var movedBeyondStationaryThreshold = false
+                            val longPressJob = if (selectionManager.mode == SelectionMode.NONE) {
+                                launch {
+                                    delay(viewConfiguration.longPressTimeoutMillis)
+                                    if (gestureType == GestureType.Undetermined && !movedBeyondStationaryThreshold) {
+                                        val currentHostViewLocation = IntArray(2)
+                                        hostView.getLocationInWindow(currentHostViewLocation)
+                                        val hostDx = (currentHostViewLocation[0] - downHostViewLocation[0]).toFloat()
+                                        val hostDy = (currentHostViewLocation[1] - downHostViewLocation[1]).toFloat()
+                                        if (hostDx * hostDx + hostDy * hostDy > stationaryThresholdSquared) {
+                                            return@launch
+                                        }
+
+                                        longPressDetected = true
+                                        gestureType = GestureType.Selection
+
+                                    // Start selection
+                                    val col = (down.position.x / baseCharWidth).toInt()
+                                        .coerceIn(0, screenState.snapshot.cols - 1)
+                                    val row = (down.position.y / baseCharHeight).toInt()
+                                        .coerceIn(0, screenState.snapshot.rows - 1)
+                                    selectionManager.startSelection(row, col, SelectionMode.BLOCK)
+                                    showMagnifier = true
+                                    magnifierPosition = down.position
+                                }
+                            }
+                        } else {
+                            null
+                        }
+
                         // 4. Track velocity for scroll fling
                         val velocityTracker = VelocityTracker()
                         velocityTracker.addPosition(down.uptimeMillis, down.position)
@@ -854,20 +871,49 @@ fun TerminalWithAccessibility(
                             if (event.changes.all { !it.pressed }) break
 
                             val change = event.changes.first()
-                            velocityTracker.addPosition(
-                                change.uptimeMillis,
-                                change.position
-                            )
+                            velocityTracker.addPosition(change.uptimeMillis, change.position)
+
                             val dragAmount = change.positionChange()
+                            val totalDx = change.position.x - down.position.x
+                            val totalDy = change.position.y - down.position.y
+                            val totalDistanceSquared = totalDx * totalDx + totalDy * totalDy
+                            val absDx = abs(totalDx)
+                            val absDy = abs(totalDy)
+
+                            if (!movedBeyondStationaryThreshold &&
+                                !longPressDetected &&
+                                gestureType == GestureType.Undetermined
+                            ) {
+                                var moved = totalDistanceSquared > stationaryThresholdSquared
+                                if (!moved) {
+                                    hostView.getLocationInWindow(currentHostViewLocation)
+                                    val hostDx =
+                                        (currentHostViewLocation[0] - downHostViewLocation[0]).toFloat()
+                                    val hostDy =
+                                        (currentHostViewLocation[1] - downHostViewLocation[1]).toFloat()
+                                    moved = hostDx * hostDx + hostDy * hostDy > stationaryThresholdSquared
+                                }
+
+                                if (moved) {
+                                    movedBeyondStationaryThreshold = true
+                                    longPressJob?.cancel()
+                                }
+                            }
 
                             // Determine gesture if still undetermined
                             if (gestureType == GestureType.Undetermined && !longPressDetected) {
-                                if (dragAmount.getDistanceSquared() > touchSlopSquared) {
-                                    longPressJob.cancel()
-                                    gestureType = GestureType.Scroll
-                                    // Clear any active selection when scrolling starts
-                                    if (selectionManager.mode != SelectionMode.NONE) {
-                                        selectionManager.clearSelection()
+                                if (totalDistanceSquared > touchSlopSquared) {
+                                    longPressJob?.cancel()
+                                    gestureType = if (absDx > absDy) {
+                                        GestureType.HorizontalSwipe
+                                    } else {
+                                        GestureType.Scroll
+                                    }
+                                    if (gestureType == GestureType.Scroll) {
+                                        // Clear any active selection when scrolling starts
+                                        if (selectionManager.mode != SelectionMode.NONE) {
+                                            selectionManager.clearSelection()
+                                        }
                                     }
                                 }
                             }
@@ -882,10 +928,7 @@ fun TerminalWithAccessibility(
                                         val dragRow =
                                             (change.position.y / baseCharHeight).toInt()
                                                 .coerceIn(0, screenState.snapshot.rows - 1)
-                                        selectionManager.updateSelection(
-                                            dragRow,
-                                            dragCol
-                                        )
+                                        selectionManager.updateSelection(dragRow, dragCol)
                                         magnifierPosition = change.position
                                     }
                                 }
@@ -894,26 +937,31 @@ fun TerminalWithAccessibility(
                                     // Update scroll offset
                                     // Drag down (positive dragAmount.y) = view older content (increase scrollbackPosition)
                                     // Drag up (negative dragAmount.y) = view newer content (decrease scrollbackPosition)
-                                    val newOffset = (scrollOffset.value + dragAmount.y)
-                                        .coerceIn(0f, maxScroll)
+                                    val oldOffset = scrollOffset.value
+                                    val newOffset = (oldOffset + dragAmount.y)
+                                        .coerceIn(0f, maxScrollPx)
                                     coroutineScope.launch {
                                         scrollOffset.snapTo(newOffset)
                                     }
 
                                     // Update terminal buffer scrollback position
                                     val scrolledLines =
-                                        (newOffset / baseCharHeight).toInt()
-                                    screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
+                                        (newOffset / baseCharHeight).roundToInt()
+                                    val oldScrollback = screenState.scrollbackPosition
+                                    val deltaLines = scrolledLines - oldScrollback
+                                    screenState.scrollBy(deltaLines)
                                 }
 
                                 else -> {}
                             }
 
-                            change.consume()
+                            if (gestureType == GestureType.Scroll || gestureType == GestureType.Selection) {
+                                change.consume()
+                            }
                         }
 
                         // 6. Gesture ended - cleanup
-                        longPressJob.cancel()
+                        longPressJob?.cancel()
 
                         when (gestureType) {
                             GestureType.Scroll -> {
@@ -928,16 +976,18 @@ fun TerminalWithAccessibility(
                                         targetValue = value
                                         // Update terminal buffer during animation
                                         val scrolledLines =
-                                            (value / baseCharHeight).toInt()
-                                        screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
+                                            (value / baseCharHeight).roundToInt()
+                                        val oldScrollback = screenState.scrollbackPosition
+                                        val deltaLines = scrolledLines - oldScrollback
+                                        screenState.scrollBy(deltaLines)
                                     }
 
                                     // Clamp final position if needed
                                     if (targetValue < 0f) {
                                         scrollOffset.snapTo(0f)
                                         screenState.scrollToBottom()
-                                    } else if (targetValue > maxScroll) {
-                                        scrollOffset.snapTo(maxScroll)
+                                    } else if (targetValue > maxScrollPx) {
+                                        scrollOffset.snapTo(maxScrollPx)
                                         screenState.scrollToTop()
                                     }
                                 }
@@ -948,6 +998,11 @@ fun TerminalWithAccessibility(
                                 if (selectionManager.isSelecting) {
                                     selectionManager.endSelection()
                                 }
+                            }
+
+                            GestureType.HorizontalSwipe -> {
+                                // Horizontal swipes (e.g., drawer open/close) are handled by parent.
+                                // Do not treat as tap/scroll/selection.
                             }
 
                             GestureType.Undetermined -> {
