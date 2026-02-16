@@ -155,6 +155,12 @@ private const val MIN_ZOOM_SCALE = 0.5f
 private const val MAX_ZOOM_SCALE = 3f
 
 /**
+ * Zoom sensitivity multiplier for pinch-to-zoom.
+ * Lower values make zooming slower and steadier.
+ */
+private const val ZOOM_SENSITIVITY = 0.35f
+
+/**
  * Size of the copy button when selection is active in dp.
  */
 private val COPY_BUTTON_SIZE = 48.dp
@@ -243,6 +249,11 @@ private const val CURLY_UNDERLINE_AMPLITUDE = 1.5f
  * Spacing between the two lines in a double underline in pixels.
  */
 private const val DOUBLE_UNDERLINE_SPACING = 2f
+
+/**
+ * Pixel threshold for treating scroll position as "at bottom".
+ */
+private const val SCROLL_EPSILON_PX = 0.5f
 
 /**
  * Terminal - A Jetpack Compose terminal screen component.
@@ -498,6 +509,20 @@ fun TerminalWithAccessibility(
     }
     // Ensure long-lived gesture coroutines always see the latest max scroll.
     val maxScrollPx by rememberUpdatedState(maxScroll)
+    val scrollOffsetPx = scrollOffset.value.coerceIn(0f, maxScrollPx)
+    val scrollLines = (scrollOffsetPx / baseCharHeight).toInt()
+    val scrollRemainder = scrollOffsetPx - scrollLines * baseCharHeight
+    val hasExtraTopLine = scrollRemainder > 0f
+    val topLineIndex = (screenState.snapshot.scrollback.size - scrollLines).coerceAtLeast(0)
+    val selectionYOffset = if (hasExtraTopLine) scrollRemainder else 0f
+    val scrollInfo = ScrollInfo(
+        scrollLines = scrollLines,
+        scrollRemainder = scrollRemainder,
+        selectionYOffset = selectionYOffset,
+        topLineIndex = topLineIndex,
+        hasExtraTopLine = hasExtraTopLine
+    )
+    val scrollInfoState = rememberUpdatedState(scrollInfo)
 
     // Selection manager
     val selectionManager = remember(terminalEmulator) {
@@ -683,19 +708,22 @@ fun TerminalWithAccessibility(
             forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
 
         // Auto-scroll to bottom when new content arrives (if not manually scrolled)
-        val wasAtBottom = screenState.scrollbackPosition == 0
+        val wasAtBottom = scrollOffset.value <= SCROLL_EPSILON_PX
         LaunchedEffect(screenState.snapshot.lines.size, screenState.snapshot.scrollback.size) {
             // Only auto-scroll if user was already at bottom
-            if (wasAtBottom && screenState.scrollbackPosition != 0) {
+            if (wasAtBottom && scrollOffset.value > SCROLL_EPSILON_PX) {
                 screenState.scrollToBottom()
                 scrollOffset.snapTo(0f)
             }
         }
 
         // Sync scrollOffset when scrollbackPosition changes externally (but not during user scrolling)
-        LaunchedEffect(screenState.scrollbackPosition) {
+        LaunchedEffect(screenState.scrollbackPosition, baseCharHeight) {
             val targetOffset = screenState.scrollbackPosition * baseCharHeight
-            if (!scrollOffset.isRunning && scrollOffset.value != targetOffset) {
+            val currentOffset = scrollOffset.value
+            val withinSameLine =
+                currentOffset >= targetOffset && currentOffset < targetOffset + baseCharHeight
+            if (!scrollOffset.isRunning && !withinSameLine) {
                 scrollOffset.snapTo(targetOffset)
             }
         }
@@ -723,6 +751,10 @@ fun TerminalWithAccessibility(
                 val touchSlopSquared = viewConfiguration.touchSlop * viewConfiguration.touchSlop
                 val stationaryThresholdPx = viewConfiguration.touchSlop / 3f
                 val stationaryThresholdSquared = stationaryThresholdPx * stationaryThresholdPx
+                fun rowFromY(y: Float, info: ScrollInfo): Int {
+                    val row = ((y - info.selectionYOffset) / baseCharHeight).toInt()
+                    return row.coerceIn(0, screenState.snapshot.rows - 1)
+                }
                     kotlinx.coroutines.coroutineScope {
                         awaitEachGesture {
                         var gestureType: GestureType = GestureType.Undetermined
@@ -735,11 +767,13 @@ fun TerminalWithAccessibility(
                         if (selectionManager.mode != SelectionMode.NONE && !selectionManager.isSelecting) {
                             val range = selectionManager.selectionRange
                             if (range != null) {
+                                val scrollInfo = scrollInfoState.value
                                 val (touchingStart, touchingEnd) = isTouchingHandle(
                                     down.position,
                                     range,
                                     baseCharWidth,
-                                    baseCharHeight
+                                    baseCharHeight,
+                                    scrollInfo.selectionYOffset
                                 )
                                 if (touchingStart || touchingEnd) {
                                     gestureType = GestureType.HandleDrag
@@ -748,12 +782,11 @@ fun TerminalWithAccessibility(
                                     magnifierPosition = down.position
 
                                     drag(down.id) { change ->
+                                        val scrollInfo = scrollInfoState.value
                                         val newCol =
                                             (change.position.x / baseCharWidth).toInt()
                                                 .coerceIn(0, screenState.snapshot.cols - 1)
-                                        val newRow =
-                                            (change.position.y / baseCharHeight).toInt()
-                                                .coerceIn(0, screenState.snapshot.rows - 1)
+                                        val newRow = rowFromY(change.position.y, scrollInfo)
 
                                         if (touchingStart) {
                                             selectionManager.updateSelectionStart(
@@ -807,8 +840,10 @@ fun TerminalWithAccessibility(
                                     val gesturePan = event.calculatePan()
 
                                     val oldScale = zoomScale
+                                    val adjustedZoom =
+                                        1f + (gestureZoom - 1f) * ZOOM_SENSITIVITY
                                     val newScale =
-                                        (oldScale * gestureZoom).coerceIn(
+                                        (oldScale * adjustedZoom).coerceIn(
                                             MIN_ZOOM_SCALE,
                                             MAX_ZOOM_SCALE
                                         )
@@ -847,10 +882,10 @@ fun TerminalWithAccessibility(
                                         gestureType = GestureType.Selection
 
                                     // Start selection
+                                    val scrollInfo = scrollInfoState.value
                                     val col = (down.position.x / baseCharWidth).toInt()
                                         .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val row = (down.position.y / baseCharHeight).toInt()
-                                        .coerceIn(0, screenState.snapshot.rows - 1)
+                                    val row = rowFromY(down.position.y, scrollInfo)
                                     selectionManager.startSelection(row, col, SelectionMode.BLOCK)
                                     showMagnifier = true
                                     magnifierPosition = down.position
@@ -922,12 +957,11 @@ fun TerminalWithAccessibility(
                             when (gestureType) {
                                 GestureType.Selection -> {
                                     if (selectionManager.isSelecting) {
+                                        val scrollInfo = scrollInfoState.value
                                         val dragCol =
                                             (change.position.x / baseCharWidth).toInt()
                                                 .coerceIn(0, screenState.snapshot.cols - 1)
-                                        val dragRow =
-                                            (change.position.y / baseCharHeight).toInt()
-                                                .coerceIn(0, screenState.snapshot.rows - 1)
+                                        val dragRow = rowFromY(change.position.y, scrollInfo)
                                         selectionManager.updateSelection(dragRow, dragCol)
                                         magnifierPosition = change.position
                                     }
@@ -1012,11 +1046,13 @@ fun TerminalWithAccessibility(
                                     selectionManager.clearSelection()
                                 } else {
                                     // Check if tap is on a hyperlink
+                                    val scrollInfo = scrollInfoState.value
                                     val tapCol = (down.position.x / baseCharWidth).toInt()
                                         .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val tapRow = (down.position.y / baseCharHeight).toInt()
-                                        .coerceIn(0, screenState.snapshot.rows - 1)
-                                    val line = screenState.getVisibleLine(tapRow)
+                                    val tapRow = rowFromY(down.position.y, scrollInfo)
+                                    val lineIndex = (scrollInfo.topLineIndex + tapRow)
+                                        .coerceIn(0, screenState.totalLines - 1)
+                                    val line = screenState.getLine(lineIndex)
                                     val hyperlinkUrl = line.getHyperlinkUrlAt(tapCol)
 
                                     if (hyperlinkUrl != null) {
@@ -1059,23 +1095,43 @@ fun TerminalWithAccessibility(
                 )
 
                 // Draw each line (zoom/pan applied via graphicsLayer)
-                for (row in 0 until screenState.snapshot.rows) {
-                    val line = screenState.getVisibleLine(row)
+                if (scrollInfo.hasExtraTopLine && scrollInfo.topLineIndex > 0) {
+                    val line = screenState.getLine(scrollInfo.topLineIndex - 1)
                     drawLine(
                         line = line,
-                        row = row,
+                        drawRow = 0,
+                        selectionRow = null,
                         charWidth = baseCharWidth,
                         charHeight = baseCharHeight,
                         charBaseline = baseCharBaseline,
                         textPaint = textPaint,
                         defaultFg = foregroundColor,
                         defaultBg = backgroundColor,
-                        selectionManager = selectionManager
+                        selectionManager = selectionManager,
+                        yOffset = -(baseCharHeight - scrollInfo.scrollRemainder)
+                    )
+                }
+
+                for (row in 0 until screenState.snapshot.rows) {
+                    val lineIndex = scrollInfo.topLineIndex + row
+                    val line = screenState.getLine(lineIndex)
+                    drawLine(
+                        line = line,
+                        drawRow = row,
+                        selectionRow = row,
+                        charWidth = baseCharWidth,
+                        charHeight = baseCharHeight,
+                        charBaseline = baseCharBaseline,
+                        textPaint = textPaint,
+                        defaultFg = foregroundColor,
+                        defaultBg = backgroundColor,
+                        selectionManager = selectionManager,
+                        yOffset = scrollInfo.selectionYOffset
                     )
                 }
 
                 // Draw cursor (only when viewing current screen, not scrollback)
-                if (screenState.snapshot.cursorVisible && screenState.scrollbackPosition == 0 && cursorBlinkVisible) {
+                if (screenState.snapshot.cursorVisible && scrollOffset.value <= SCROLL_EPSILON_PX && cursorBlinkVisible) {
                     drawCursor(
                         row = screenState.snapshot.cursorRow,
                         col = screenState.snapshot.cursorCol,
@@ -1097,6 +1153,7 @@ fun TerminalWithAccessibility(
                             col = startPosition.second,
                             charWidth = baseCharWidth,
                             charHeight = baseCharHeight,
+                            yOffset = scrollInfo.selectionYOffset,
                             pointingDown = false,
                         )
 
@@ -1107,6 +1164,7 @@ fun TerminalWithAccessibility(
                             col = endPosition.second,
                             charWidth = baseCharWidth,
                             charHeight = baseCharHeight,
+                            yOffset = scrollInfo.selectionYOffset,
                             pointingDown = true,
                         )
                     }
@@ -1146,7 +1204,8 @@ fun TerminalWithAccessibility(
                 textPaint = textPaint,
                 backgroundColor = backgroundColor,
                 foregroundColor = foregroundColor,
-                selectionManager = selectionManager
+                selectionManager = selectionManager,
+                scrollInfo = scrollInfo
             )
         }
 
@@ -1157,7 +1216,8 @@ fun TerminalWithAccessibility(
                 // Position copy button above the selection
                 val endPosition = range.getEndPosition()
                 val buttonX = endPosition.second * baseCharWidth
-                val buttonY = endPosition.first * baseCharHeight - with(density) { COPY_BUTTON_OFFSET.toPx() }
+                val buttonY = endPosition.first * baseCharHeight + scrollInfo.selectionYOffset -
+                    with(density) { COPY_BUTTON_OFFSET.toPx() }
 
                 Box(
                     modifier = Modifier
@@ -1211,27 +1271,40 @@ fun TerminalWithAccessibility(
 }
 
 /**
+ * Rendering info derived from current scroll offset.
+ */
+private data class ScrollInfo(
+    val scrollLines: Int,
+    val scrollRemainder: Float,
+    val selectionYOffset: Float,
+    val topLineIndex: Int,
+    val hasExtraTopLine: Boolean
+)
+
+/**
  * Draw a single terminal line.
  */
 private fun DrawScope.drawLine(
     line: TerminalLine,
-    row: Int,
+    drawRow: Int,
+    selectionRow: Int?,
     charWidth: Float,
     charHeight: Float,
     charBaseline: Float,
     textPaint: TextPaint,
     defaultFg: Color,
     defaultBg: Color,
-    selectionManager: SelectionManager
+    selectionManager: SelectionManager,
+    yOffset: Float = 0f
 ) {
-    val y = row * charHeight
+    val y = drawRow * charHeight + yOffset
     var x = 0f
 
     line.cells.forEachIndexed { col, cell ->
         val cellWidth = charWidth * cell.width
 
         // Check if this cell is selected
-        val isSelected = selectionManager.isCellSelected(row, col)
+        val isSelected = selectionRow != null && selectionManager.isCellSelected(selectionRow, col)
 
         // Check if this cell is part of a hyperlink
         val isHyperlink = line.getHyperlinkUrlAt(col) != null
@@ -1251,9 +1324,9 @@ private fun DrawScope.drawLine(
         }
 
         // Draw character
-        if (cell.char != ' ' || cell.combiningChars.isNotEmpty()) {
+        if ((cell.char != ' ' && cell.char != '\u0000') || cell.combiningChars.isNotEmpty()) {
             val text = buildString {
-                append(cell.char)
+                append(if (cell.char == '\u0000') ' ' else cell.char)
                 cell.combiningChars.forEach { append(it) }
             }
 
@@ -1395,15 +1468,16 @@ private fun isTouchingHandle(
     range: SelectionRange,
     charWidth: Float,
     charHeight: Float,
+    yOffset: Float,
     hitRadius: Float = HANDLE_HIT_RADIUS
 ): Pair<Boolean, Boolean> {
     val startPos = Offset(
         range.startCol * charWidth + charWidth / 2,
-        range.startRow * charHeight
+        range.startRow * charHeight + yOffset
     )
     val endPos = Offset(
         range.endCol * charWidth + charWidth / 2,
-        range.endRow * charHeight + charHeight
+        range.endRow * charHeight + charHeight + yOffset
     )
 
     val distToStart = (touchPos - startPos).getDistance()
@@ -1428,7 +1502,8 @@ private fun MagnifyingGlass(
     textPaint: TextPaint,
     backgroundColor: Color,
     foregroundColor: Color,
-    selectionManager: SelectionManager
+    selectionManager: SelectionManager,
+    scrollInfo: ScrollInfo
 ) {
     val magnifierSize = MAGNIFIER_SIZE_DP.dp
     val magnifierScale = MAGNIFIER_SCALE
@@ -1477,22 +1552,28 @@ private fun MagnifyingGlass(
             translate(-centerOffset.x * magnifierScale, -centerOffset.y * magnifierScale) {
                 scale(magnifierScale, magnifierScale) {
                     // Calculate which rows to draw
-                    val centerRow = (position.y / baseCharHeight).toInt().coerceIn(0, screenState.snapshot.rows - 1)
+                    val centerRow = ((position.y - scrollInfo.selectionYOffset) / baseCharHeight)
+                        .toInt()
+                        .coerceIn(0, screenState.snapshot.rows - 1)
 
                     // Draw a few rows around the touch point
                     for (rowOffset in -MAGNIFIER_ROW_RANGE..MAGNIFIER_ROW_RANGE) {
                         val row = (centerRow + rowOffset).coerceIn(0, screenState.snapshot.rows - 1)
-                        val line = screenState.getVisibleLine(row)
+                        val lineIndex = (scrollInfo.topLineIndex + row)
+                            .coerceIn(0, screenState.totalLines - 1)
+                        val line = screenState.getLine(lineIndex)
                         drawLine(
                             line = line,
-                            row = row,
+                            drawRow = row,
+                            selectionRow = row,
                             charWidth = baseCharWidth,
                             charHeight = baseCharHeight,
                             charBaseline = baseCharBaseline,
                             textPaint = textPaint,
                             defaultFg = foregroundColor,
                             defaultBg = backgroundColor,
-                            selectionManager = selectionManager
+                            selectionManager = selectionManager,
+                            yOffset = scrollInfo.selectionYOffset
                         )
                     }
                 }
@@ -1509,6 +1590,7 @@ private fun DrawScope.drawSelectionHandle(
     col: Int,
     charWidth: Float,
     charHeight: Float,
+    yOffset: Float,
     pointingDown: Boolean,
     color: Color = Color.White,
 ) {
@@ -1516,7 +1598,7 @@ private fun DrawScope.drawSelectionHandle(
 
     // Position handle at the character position
     val charX = col * charWidth
-    val charY = row * charHeight
+    val charY = row * charHeight + yOffset
 
     // Center the handle horizontally on the character
     val handleX = charX + charWidth / 2
