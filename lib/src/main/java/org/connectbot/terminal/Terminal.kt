@@ -90,7 +90,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 /**
  * Gesture type for unified gesture handling state machine.
@@ -249,6 +248,11 @@ private const val CURLY_UNDERLINE_AMPLITUDE = 1.5f
  * Spacing between the two lines in a double underline in pixels.
  */
 private const val DOUBLE_UNDERLINE_SPACING = 2f
+
+/**
+ * Extra bottom padding (in dp) applied only when scrolled to bottom.
+ */
+private const val TERMINAL_BOTTOM_PADDING_DP = 2f
 
 /**
  * Pixel threshold for treating scroll position as "at bottom".
@@ -504,25 +508,6 @@ fun TerminalWithAccessibility(
 
     // Scroll animation state
     val scrollOffset = remember(terminalEmulator) { Animatable(0f) }
-    val maxScroll = remember(screenState.snapshot.scrollback.size, baseCharHeight) {
-        screenState.snapshot.scrollback.size * baseCharHeight
-    }
-    // Ensure long-lived gesture coroutines always see the latest max scroll.
-    val maxScrollPx by rememberUpdatedState(maxScroll)
-    val scrollOffsetPx = scrollOffset.value.coerceIn(0f, maxScrollPx)
-    val scrollLines = (scrollOffsetPx / baseCharHeight).toInt()
-    val scrollRemainder = scrollOffsetPx - scrollLines * baseCharHeight
-    val hasExtraTopLine = scrollRemainder > 0f
-    val topLineIndex = (screenState.snapshot.scrollback.size - scrollLines).coerceAtLeast(0)
-    val selectionYOffset = if (hasExtraTopLine) scrollRemainder else 0f
-    val scrollInfo = ScrollInfo(
-        scrollLines = scrollLines,
-        scrollRemainder = scrollRemainder,
-        selectionYOffset = selectionYOffset,
-        topLineIndex = topLineIndex,
-        hasExtraTopLine = hasExtraTopLine
-    )
-    val scrollInfoState = rememberUpdatedState(scrollInfo)
 
     // Selection manager
     val selectionManager = remember(terminalEmulator) {
@@ -615,6 +600,43 @@ fun TerminalWithAccessibility(
     var availableWidth by remember { mutableStateOf(0) }
     var availableHeight by remember { mutableStateOf(0) }
 
+    val newCols =
+        forcedSize?.second ?: charsPerDimension(availableWidth, baseCharWidth)
+    val newRows =
+        forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
+    val slackPx =
+        if (availableHeight == 0 || newRows == 0) {
+            0f
+        } else {
+            (availableHeight - newRows * baseCharHeight).coerceAtLeast(0f)
+        }
+
+    val maxScroll = remember(screenState.snapshot.scrollback.size, baseCharHeight) {
+        screenState.snapshot.scrollback.size * baseCharHeight
+    }
+    // Ensure long-lived gesture coroutines always see the latest max scroll.
+    val maxScrollPx by rememberUpdatedState(maxScroll)
+    val scrollOffsetPx = scrollOffset.value.coerceIn(0f, maxScrollPx)
+    val effectiveScrollOffsetPx = scrollOffsetPx + slackPx
+    val scrollLines = (effectiveScrollOffsetPx / baseCharHeight).toInt()
+    val scrollRemainder = effectiveScrollOffsetPx - scrollLines * baseCharHeight
+    val bottomPaddingPx =
+        if (scrollOffset.value <= SCROLL_EPSILON_PX) {
+            with(density) { TERMINAL_BOTTOM_PADDING_DP.dp.toPx() }
+        } else {
+            0f
+        }
+    val topLineIndex = (screenState.snapshot.scrollback.size - scrollLines).coerceAtLeast(0)
+    val selectionYOffset = scrollRemainder - bottomPaddingPx
+    val scrollInfo = ScrollInfo(
+        scrollLines = scrollLines,
+        scrollRemainder = scrollRemainder,
+        selectionYOffset = selectionYOffset,
+        topLineIndex = topLineIndex,
+        hasExtraTopLine = scrollRemainder > 0f
+    )
+    val scrollInfoState = rememberUpdatedState(scrollInfo)
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -690,22 +712,11 @@ fun TerminalWithAccessibility(
             }
 
             // Use base dimensions for terminal sizing (not zoomed dimensions)
-            val newCols =
-                forcedSize?.second ?: charsPerDimension(availableWidth, baseCharWidth)
-            val newRows =
-                forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
-
             val dimensions = terminalEmulator.dimensions
             if (newRows != dimensions.rows || newCols != dimensions.columns) {
                 terminalEmulator.resize(newRows, newCols)
             }
         }
-
-        // Use base dimensions for terminal sizing (not zoomed dimensions)
-        val newCols =
-            forcedSize?.second ?: charsPerDimension(availableWidth, baseCharWidth)
-        val newRows =
-            forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
 
         // Auto-scroll to bottom when new content arrives (if not manually scrolled)
         val wasAtBottom = scrollOffset.value <= SCROLL_EPSILON_PX
@@ -980,7 +991,7 @@ fun TerminalWithAccessibility(
 
                                     // Update terminal buffer scrollback position
                                     val scrolledLines =
-                                        (newOffset / baseCharHeight).roundToInt()
+                                        (newOffset / baseCharHeight).toInt()
                                     val oldScrollback = screenState.scrollbackPosition
                                     val deltaLines = scrolledLines - oldScrollback
                                     screenState.scrollBy(deltaLines)
@@ -1010,7 +1021,7 @@ fun TerminalWithAccessibility(
                                         targetValue = value
                                         // Update terminal buffer during animation
                                         val scrolledLines =
-                                            (value / baseCharHeight).roundToInt()
+                                            (value / baseCharHeight).toInt()
                                         val oldScrollback = screenState.scrollbackPosition
                                         val deltaLines = scrolledLines - oldScrollback
                                         screenState.scrollBy(deltaLines)
@@ -1095,22 +1106,21 @@ fun TerminalWithAccessibility(
                 )
 
                 // Draw each line (zoom/pan applied via graphicsLayer)
-                if (scrollInfo.hasExtraTopLine && scrollInfo.topLineIndex > 0) {
-                    val line = screenState.getLine(scrollInfo.topLineIndex - 1)
-                    drawLine(
-                        line = line,
-                        drawRow = 0,
-                        selectionRow = null,
-                        charWidth = baseCharWidth,
-                        charHeight = baseCharHeight,
-                        charBaseline = baseCharBaseline,
-                        textPaint = textPaint,
-                        defaultFg = foregroundColor,
-                        defaultBg = backgroundColor,
-                        selectionManager = selectionManager,
-                        yOffset = -(baseCharHeight - scrollInfo.scrollRemainder)
-                    )
-                }
+                val extraTopIndex = (scrollInfo.topLineIndex - 1).coerceAtLeast(0)
+                val extraTopLine = screenState.getLine(extraTopIndex)
+                drawLine(
+                    line = extraTopLine,
+                    drawRow = 0,
+                    selectionRow = null,
+                    charWidth = baseCharWidth,
+                    charHeight = baseCharHeight,
+                    charBaseline = baseCharBaseline,
+                    textPaint = textPaint,
+                    defaultFg = foregroundColor,
+                    defaultBg = backgroundColor,
+                    selectionManager = selectionManager,
+                    yOffset = scrollInfo.selectionYOffset - baseCharHeight
+                )
 
                 for (row in 0 until screenState.snapshot.rows) {
                     val lineIndex = scrollInfo.topLineIndex + row
@@ -1130,6 +1140,24 @@ fun TerminalWithAccessibility(
                     )
                 }
 
+                val extraBottomIndex =
+                    (scrollInfo.topLineIndex + screenState.snapshot.rows)
+                        .coerceAtMost(screenState.totalLines - 1)
+                val extraBottomLine = screenState.getLine(extraBottomIndex)
+                drawLine(
+                    line = extraBottomLine,
+                    drawRow = screenState.snapshot.rows,
+                    selectionRow = null,
+                    charWidth = baseCharWidth,
+                    charHeight = baseCharHeight,
+                    charBaseline = baseCharBaseline,
+                    textPaint = textPaint,
+                    defaultFg = foregroundColor,
+                    defaultBg = backgroundColor,
+                    selectionManager = selectionManager,
+                    yOffset = scrollInfo.selectionYOffset
+                )
+
                 // Draw cursor (only when viewing current screen, not scrollback)
                 if (screenState.snapshot.cursorVisible && scrollOffset.value <= SCROLL_EPSILON_PX && cursorBlinkVisible) {
                     drawCursor(
@@ -1137,6 +1165,7 @@ fun TerminalWithAccessibility(
                         col = screenState.snapshot.cursorCol,
                         charWidth = baseCharWidth,
                         charHeight = baseCharHeight,
+                        yOffset = scrollInfo.selectionYOffset,
                         foregroundColor = foregroundColor,
                         cursorShape = screenState.snapshot.cursorShape
                     )
@@ -1632,11 +1661,12 @@ private fun DrawScope.drawCursor(
     col: Int,
     charWidth: Float,
     charHeight: Float,
+    yOffset: Float = 0f,
     foregroundColor: Color,
     cursorShape: CursorShape = CursorShape.BLOCK
 ) {
     val x = col * charWidth
-    val y = row * charHeight
+    val y = row * charHeight + yOffset
 
     when (cursorShape) {
         CursorShape.BLOCK -> {
