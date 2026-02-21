@@ -22,6 +22,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.annotation.VisibleForTesting
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -248,6 +249,12 @@ internal class TerminalEmulatorImpl(
     // Reusable CellRun for fetching cell data
     private val cellRun = CellRun()
 
+    // Resize pop tracking: captures scrollback lines popped during resize
+    // so their semantic segments can be placed on the correct screen rows.
+    // Guarded by damageLock.
+    private var trackResizePops = false
+    private val resizePopLines = mutableListOf<TerminalLine>()
+
     // Current screen lines cache
     private var currentLines = List(initialRows) { row ->
         TerminalLine.empty(row, initialCols, currentDefaultForeground, currentDefaultBackground)
@@ -285,28 +292,108 @@ internal class TerminalEmulatorImpl(
      * Resize the terminal.
      */
     override fun resize(newRows: Int, newCols: Int) {
-        rows = newRows
-        cols = newCols
-        terminalNative.resize(newRows, newCols)
+        val oldCols = cols
+        val colsChanged = newCols != oldCols
 
-        // Capture current default colors (thread-safe)
+        // Before resize: snapshot on-screen lines with libvterm's continuation flags.
+        // This must happen before terminalNative.resize() because that call reflows
+        // the screen buffer and changes the continuation state.
+        val preResizeScreenLines: List<TerminalLine>
         val currentDefaultFg: Color
         val currentDefaultBg: Color
         synchronized(damageLock) {
             currentDefaultFg = currentDefaultForeground
             currentDefaultBg = currentDefaultBackground
+            preResizeScreenLines = if (colsChanged) {
+                currentLines.mapIndexed { index, line ->
+                    line.copy(
+                        continuation = terminalNative.getLineContinuation(index),
+                        cells = normalizeTrailingBlanks(line.cells, currentDefaultFg, currentDefaultBg)
+                    )
+                }
+            } else {
+                emptyList()
+            }
+
+            // Enable pop tracking so popScrollbackLine captures popped lines
+            resizePopLines.clear()
+            trackResizePops = true
         }
 
-        // Resize currentLines to match new dimensions, preserving semantic segments
+        rows = newRows
+        cols = newCols
+        terminalNative.resize(newRows, newCols)
+
+        // Collect popped lines and stop tracking
+        val poppedLines: List<TerminalLine>
         synchronized(damageLock) {
-            val oldLines = currentLines
-            currentLines = List(newRows) { row ->
-                if (row < oldLines.size) {
-                    // Preserve semantic segments from the old line
-                    TerminalLine.empty(row, newCols, currentDefaultFg, currentDefaultBg)
-                        .copy(semanticSegments = oldLines[row].semanticSegments)
+            trackResizePops = false
+            poppedLines = resizePopLines.toList()
+            resizePopLines.clear()
+        }
+
+        synchronized(damageLock) {
+            // Reflow scrollback
+            if (colsChanged && scrollback.isNotEmpty()) {
+                val reflowed = reflowScrollback(
+                    lines = scrollback,
+                    newCols = newCols,
+                    defaultFg = currentDefaultFg,
+                    defaultBg = currentDefaultBg
+                )
+                scrollback.clear()
+                scrollback.addAll(reflowed)
+                scrollbackDirty = true
+            }
+
+            if (colsChanged) {
+                // Width changed: reflow both on-screen and popped segments
+                val reflowedScreen = if (preResizeScreenLines.isNotEmpty()) {
+                    reflowScrollback(
+                        lines = preResizeScreenLines,
+                        newCols = newCols,
+                        defaultFg = currentDefaultFg,
+                        defaultBg = currentDefaultBg
+                    )
                 } else {
+                    emptyList()
+                }
+
+                // Popped lines are in callback order (highest row first, descending).
+                // Reverse to get top-to-bottom order, then reflow at new width.
+                val reflowedPops = if (poppedLines.isNotEmpty()) {
+                    reflowScrollback(
+                        lines = poppedLines.reversed(),
+                        newCols = newCols,
+                        defaultFg = currentDefaultFg,
+                        defaultBg = currentDefaultBg
+                    )
+                } else {
+                    emptyList()
+                }
+
+                currentLines = distributeReflowedSegments(
+                    newRows, newCols, reflowedScreen, reflowedPops,
+                    currentDefaultFg, currentDefaultBg
+                )
+            } else {
+                // Only row count changed: preserve segments by row index,
+                // placing popped scrollback segments at the top
+                val oldLines = currentLines
+                // Pops fill from below the reflowed content upward, so reversed
+                // gives top-to-bottom order
+                val popsTopToBottom = poppedLines.reversed()
+
+                currentLines = List(newRows) { row ->
+                    val segments = when {
+                        row < popsTopToBottom.size ->
+                            popsTopToBottom[row].semanticSegments
+                        row < oldLines.size ->
+                            oldLines[row].semanticSegments
+                        else -> emptyList()
+                    }
                     TerminalLine.empty(row, newCols, currentDefaultFg, currentDefaultBg)
+                        .copy(semanticSegments = segments)
                 }
             }
         }
@@ -494,9 +581,9 @@ internal class TerminalEmulatorImpl(
         return 0
     }
 
-    override fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int {
+    override fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>, continuation: Boolean): Int {
         // Convert ScreenCell array to TerminalLine
-        val cellList = cells.take(cols).map { screenCell ->
+        val cellList = cells.map { screenCell ->
             TerminalLine.Cell(
                 char = screenCell.char,
                 combiningChars = screenCell.combiningChars.filter { it != '\u0000' },
@@ -520,7 +607,13 @@ internal class TerminalEmulatorImpl(
                 emptyList()
             }
 
-            val line = TerminalLine(row = -1, cells = cellList, semanticSegments = line0Segments)
+            val line = TerminalLine(
+                row = -1,
+                cells = cellList,
+                semanticSegments = line0Segments,
+                colsAtCapture = cols,
+                continuation = continuation
+            )
 
             scrollback.add(line)
             if (scrollback.size > maxScrollbackLines) {
@@ -555,8 +648,54 @@ internal class TerminalEmulatorImpl(
     }
 
     override fun popScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int {
-        // Not implemented - scrollback is managed separately
-        return 0
+        synchronized(damageLock) {
+            if (scrollback.isEmpty()) return 0
+
+            // Pop the most recently pushed line (LIFO order)
+            val line = scrollback.removeAt(scrollback.size - 1)
+            scrollbackDirty = true
+
+            // During resize, track popped lines so their segments can be placed
+            // on the correct screen rows after reflow
+            if (trackResizePops) {
+                resizePopLines.add(line)
+            }
+
+            // Expand cells back to column-indexed positions.
+            // Wide chars (width=2) were stored as single Cell objects during push,
+            // so we need to place them at the correct column offset and leave
+            // the next slot null (JNI bridge handles null as empty cell).
+            var colIndex = 0
+            for (cell in line.cells) {
+                if (colIndex >= cols) break
+
+                val fgArgb = cell.fgColor.toArgb()
+                val bgArgb = cell.bgColor.toArgb()
+
+                cells[colIndex] = ScreenCell(
+                    char = cell.char,
+                    combiningChars = cell.combiningChars,
+                    fgRed = (fgArgb shr 16) and 0xFF,
+                    fgGreen = (fgArgb shr 8) and 0xFF,
+                    fgBlue = fgArgb and 0xFF,
+                    bgRed = (bgArgb shr 16) and 0xFF,
+                    bgGreen = (bgArgb shr 8) and 0xFF,
+                    bgBlue = bgArgb and 0xFF,
+                    bold = cell.bold,
+                    italic = cell.italic,
+                    underline = cell.underline,
+                    reverse = cell.reverse,
+                    strike = cell.strike,
+                    width = cell.width
+                )
+
+                colIndex += cell.width
+            }
+
+            // Remaining columns stay null — JNI bridge initializes them as empty cells
+            // Return 2 for continuation lines, 1 for non-continuation
+            return if (line.continuation) 2 else 1
+        }
     }
 
     override fun onKeyboardInput(data: ByteArray): Int {
@@ -843,7 +982,12 @@ internal class TerminalEmulatorImpl(
         synchronized(damageLock) {
             currentLines = currentLines.toMutableList().apply {
                 val existingSegments = this[row].semanticSegments
-                this[row] = TerminalLine(row, cells, semanticSegments = existingSegments)
+                this[row] = TerminalLine(
+                    row,
+                    cells,
+                    semanticSegments = existingSegments,
+                    colsAtCapture = cols
+                )
             }
         }
     }
@@ -893,6 +1037,281 @@ internal class TerminalEmulatorImpl(
                 damagePosted = true
             }
         }
+    }
+
+    private fun reflowScrollback(
+        lines: List<TerminalLine>,
+        newCols: Int,
+        defaultFg: Color,
+        defaultBg: Color
+    ): List<TerminalLine> {
+        if (lines.isEmpty() || newCols <= 0) {
+            return lines
+        }
+
+        val result = mutableListOf<TerminalLine>()
+        var logicalCells = mutableListOf<TerminalLine.Cell>()
+        var logicalSegments = mutableListOf<SemanticSegment>()
+        var logicalWidth = 0
+
+        fun flushLogicalLine() {
+            if (logicalCells.isEmpty()) {
+                return
+            }
+            result.addAll(
+                wrapLogicalLine(
+                    cells = logicalCells,
+                    segments = logicalSegments,
+                    newCols = newCols,
+                    defaultFg = defaultFg,
+                    defaultBg = defaultBg
+                )
+            )
+            logicalCells = mutableListOf()
+            logicalSegments = mutableListOf()
+            logicalWidth = 0
+        }
+
+        for (line in lines) {
+            val trimmedCells = trimTrailingBlankCells(line.cells)
+            val lineWidth = cellsWidth(trimmedCells)
+
+            if (trimmedCells.isEmpty()) {
+                flushLogicalLine()
+                result.add(blankLine(newCols, defaultFg, defaultBg))
+                continue
+            }
+
+            // If this line is NOT a continuation, flush the previous logical line first
+            if (!line.continuation && logicalCells.isNotEmpty()) {
+                flushLogicalLine()
+            }
+
+            val offset = logicalWidth
+            logicalCells.addAll(trimmedCells)
+            if (line.semanticSegments.isNotEmpty()) {
+                for (segment in line.semanticSegments) {
+                    logicalSegments.add(
+                        segment.copy(
+                            startCol = segment.startCol + offset,
+                            endCol = segment.endCol + offset
+                        )
+                    )
+                }
+            }
+            logicalWidth += lineWidth
+        }
+
+        flushLogicalLine()
+
+        return if (result.size > maxScrollbackLines) {
+            result.takeLast(maxScrollbackLines)
+        } else {
+            result
+        }
+    }
+
+    private fun wrapLogicalLine(
+        cells: List<TerminalLine.Cell>,
+        segments: List<SemanticSegment>,
+        newCols: Int,
+        defaultFg: Color,
+        defaultBg: Color
+    ): List<TerminalLine> {
+        val lines = mutableListOf<TerminalLine>()
+        var lineCells = mutableListOf<TerminalLine.Cell>()
+        var lineWidth = 0
+        var lineStartCol = 0
+
+        fun emitLine() {
+            if (lineWidth == 0 && lineCells.isEmpty()) {
+                return
+            }
+            val lineEndCol = lineStartCol + lineWidth
+            val lineSegments = if (segments.isEmpty()) {
+                emptyList()
+            } else {
+                segments.filter { it.endCol > lineStartCol && it.startCol < lineEndCol }
+                    .map { segment ->
+                        val start = if (segment.startCol < lineStartCol) lineStartCol else segment.startCol
+                        val end = if (segment.endCol > lineEndCol) lineEndCol else segment.endCol
+                        segment.copy(
+                            startCol = start - lineStartCol,
+                            endCol = end - lineStartCol
+                        )
+                    }
+            }
+
+            val paddedCells = padLineCells(lineCells, lineWidth, newCols, defaultFg, defaultBg)
+            lines.add(
+                TerminalLine(
+                    row = -1,
+                    cells = paddedCells,
+                    semanticSegments = lineSegments,
+                    colsAtCapture = newCols,
+                    continuation = lines.isNotEmpty()
+                )
+            )
+
+            lineStartCol = lineEndCol
+            lineCells = mutableListOf()
+            lineWidth = 0
+        }
+
+        for (cell in cells) {
+            val cellWidth = cell.width.coerceAtLeast(1)
+            if (lineWidth > 0 && lineWidth + cellWidth > newCols) {
+                emitLine()
+            }
+            lineCells.add(cell)
+            lineWidth += cellWidth
+            if (lineWidth == newCols) {
+                emitLine()
+            }
+        }
+
+        emitLine()
+        return lines
+    }
+
+    private fun trimTrailingBlankCells(cells: List<TerminalLine.Cell>): List<TerminalLine.Cell> {
+        var end = cells.size
+        while (end > 0) {
+            val cell = cells[end - 1]
+            if (cell.char != '\u0000' || cell.combiningChars.isNotEmpty()) {
+                break
+            }
+            end--
+        }
+        return if (end == cells.size) {
+            cells
+        } else {
+            cells.subList(0, end)
+        }
+    }
+
+    private fun cellsWidth(cells: List<TerminalLine.Cell>): Int {
+        var width = 0
+        for (cell in cells) {
+            width += cell.width.coerceAtLeast(1)
+        }
+        return width
+    }
+
+    private fun blankLine(newCols: Int, defaultFg: Color, defaultBg: Color): TerminalLine {
+        return TerminalLine(
+            row = -1,
+            cells = List(newCols) { blankCell(defaultFg, defaultBg) },
+            semanticSegments = emptyList(),
+            colsAtCapture = newCols
+        )
+    }
+
+    private fun padLineCells(
+        cells: List<TerminalLine.Cell>,
+        lineWidth: Int,
+        newCols: Int,
+        defaultFg: Color,
+        defaultBg: Color
+    ): List<TerminalLine.Cell> {
+        if (lineWidth >= newCols) {
+            return cells
+        }
+        val padded = cells.toMutableList()
+        val padCount = newCols - lineWidth
+        repeat(padCount) {
+            padded.add(blankCell(defaultFg, defaultBg))
+        }
+        return padded
+    }
+
+    private fun blankCell(defaultFg: Color, defaultBg: Color): TerminalLine.Cell {
+        return TerminalLine.Cell(
+            char = '\u0000',
+            fgColor = defaultFg,
+            bgColor = defaultBg
+        )
+    }
+
+    /**
+     * Distribute reflowed on-screen and popped scrollback segments across new screen rows.
+     *
+     * Layout (top to bottom):
+     *   1. Empty rows (if any remain unfilled)
+     *   2. Popped scrollback content (fills from just above on-screen content, upward)
+     *   3. Reflowed on-screen content (aligned to bottom of screen)
+     */
+    private fun distributeReflowedSegments(
+        newRows: Int,
+        newCols: Int,
+        reflowedScreen: List<TerminalLine>,
+        reflowedPops: List<TerminalLine>,
+        defaultFg: Color,
+        defaultBg: Color
+    ): List<TerminalLine> {
+        // On-screen content anchors to the bottom. If there are more reflowed
+        // lines than screen rows, skip the top ones (they were pushed to
+        // scrollback via sb_pushline callbacks during resize).
+        val screenLineCount = reflowedScreen.size.coerceAtMost(newRows)
+        val screenSkip = (reflowedScreen.size - newRows).coerceAtLeast(0)
+        val screenStart = newRows - screenLineCount
+
+        // Popped content fills from just above the on-screen content, upward.
+        val popLineCount = reflowedPops.size.coerceAtMost(screenStart)
+        val popSkip = (reflowedPops.size - screenStart).coerceAtLeast(0)
+        val popStart = screenStart - popLineCount
+
+        return List(newRows) { row ->
+            val segments = when {
+                row >= screenStart -> {
+                    val idx = screenSkip + (row - screenStart)
+                    if (idx in reflowedScreen.indices) reflowedScreen[idx].semanticSegments
+                    else emptyList()
+                }
+                row >= popStart -> {
+                    val idx = popSkip + (row - popStart)
+                    if (idx in reflowedPops.indices) reflowedPops[idx].semanticSegments
+                    else emptyList()
+                }
+                else -> emptyList()
+            }
+            TerminalLine.empty(row, newCols, defaultFg, defaultBg)
+                .copy(semanticSegments = segments)
+        }
+    }
+
+    /**
+     * Convert trailing default-blank cells (space char with default colors and no attrs)
+     * to null-char cells so that [trimTrailingBlankCells] can trim them correctly.
+     *
+     * On-screen cells from [getCellRun] use ' ' for empty cells, while scrollback
+     * cells from [pushScrollbackLine] use '\u0000'. This normalization makes them
+     * consistent for the shared reflow logic.
+     */
+    private fun normalizeTrailingBlanks(
+        cells: List<TerminalLine.Cell>,
+        defaultFg: Color,
+        defaultBg: Color
+    ): List<TerminalLine.Cell> {
+        var end = cells.size
+        while (end > 0) {
+            val cell = cells[end - 1]
+            if (cell.char != ' ' || cell.combiningChars.isNotEmpty() ||
+                cell.fgColor != defaultFg || cell.bgColor != defaultBg ||
+                cell.bold || cell.italic || cell.underline != 0 ||
+                cell.blink || cell.reverse || cell.strike
+            ) {
+                break
+            }
+            end--
+        }
+        if (end == cells.size) return cells
+
+        val result = cells.toMutableList()
+        for (i in end until result.size) {
+            result[i] = result[i].copy(char = '\u0000')
+        }
+        return result
     }
 
     /**

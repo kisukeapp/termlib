@@ -122,6 +122,18 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     }
 
     /**
+     * Query whether a screen row is a continuation of the previous row.
+     * Uses libvterm's lineinfo, which tracks this explicitly.
+     *
+     * @param row Row index (0-based)
+     * @return true if this row is a continuation (wrapped from the previous row)
+     */
+    fun getLineContinuation(row: Int): Boolean {
+        checkNotClosed()
+        return nativeGetLineContinuation(nativePtr, row)
+    }
+
+    /**
      * Set ANSI palette colors (indices 0-15).
      *
      * This configures the 16 ANSI colors used by terminal escape sequences.
@@ -185,6 +197,7 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     private external fun nativeDispatchKey(ptr: Long, modifiers: Int, key: Int): Boolean
     private external fun nativeDispatchCharacter(ptr: Long, modifiers: Int, character: Int): Boolean
     private external fun nativeGetCellRun(ptr: Long, row: Int, col: Int, run: CellRun): Int
+    private external fun nativeGetLineContinuation(ptr: Long, row: Int): Boolean
     private external fun nativeSetPaletteColors(ptr: Long, colors: IntArray, count: Int): Int
     private external fun nativeSetDefaultColors(ptr: Long, fgColor: Int, bgColor: Int): Int
 

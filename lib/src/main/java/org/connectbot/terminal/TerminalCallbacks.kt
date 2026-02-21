@@ -74,18 +74,19 @@ internal interface TerminalCallbacks {
     /**
      * Called when a line is pushed to scrollback buffer.
      *
-     * @param cols Number of columns in the line
+     * @param cols Number of screen columns at capture time
      * @param cells Array of screen cells
+     * @param continuation True if this line is a continuation of the previous line (line wrapping)
      * @return 0 on success
      */
-    fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int
+    fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>, continuation: Boolean): Int
 
     /**
      * Called when a line should be popped from scrollback buffer.
      *
      * @param cols Number of columns expected
      * @param cells Array to fill with screen cells
-     * @return 0 on success
+     * @return 0 if no scrollback, 1 if line popped (not continuation), 2 if line popped (continuation)
      */
     fun popScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int
 

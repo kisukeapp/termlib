@@ -69,7 +69,7 @@ Terminal::Terminal(JNIEnv* env, jobject callbacks, int rows, int cols)
         LOGE("Failed to find bell method");
     }
     mPushScrollbackMethod = env->GetMethodID(callbacksClass, "pushScrollbackLine",
-        "(I[Lorg/connectbot/terminal/ScreenCell;)I");
+        "(I[Lorg/connectbot/terminal/ScreenCell;Z)I");
     if (!mPushScrollbackMethod) {
         LOGE("Failed to find pushScrollbackLine method");
     }
@@ -182,6 +182,7 @@ Terminal::Terminal(JNIEnv* env, jobject callbacks, int rows, int cols)
     // Get screen and set up callbacks
     mVts = vterm_obtain_screen(mVt);
     vterm_screen_enable_altscreen(mVts, 1);
+    vterm_screen_enable_reflow(mVts, true);
 
     // Initialize callback structure as member variable so it doesn't go out of scope
     mScreenCallbacks = {
@@ -294,6 +295,19 @@ int Terminal::resize(int rows, int cols) {
     }
 
     return 0;
+}
+
+// Line info queries
+bool Terminal::getLineContinuation(int row) {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+
+    if (!mVt || row < 0 || row >= mRows) return false;
+
+    VTermState* state = vterm_obtain_state(mVt);
+    if (!state) return false;
+
+    const VTermLineInfo* info = vterm_state_get_lineinfo(state, row);
+    return info && info->continuation;
 }
 
 // Color configuration
@@ -423,8 +437,8 @@ int Terminal::getCellRun(JNIEnv* env, int row, int col, jobject runObject) {
         }
 
         // Add character(s) to run
-        if (currentCell.chars[0] == 0) {
-            // Empty cell
+        if (currentCell.chars[0] == 0 || currentCell.chars[0] == (uint32_t)-1) {
+            // Empty cell or orphaned wide-char placeholder
             chars[runLength++] = ' ';
         } else {
             // Convert UTF-32 to UTF-16 (handle surrogate pairs)
@@ -529,15 +543,15 @@ int Terminal::termBell(void* user) {
     return 1;
 }
 
-int Terminal::termSbPushline(int cols, const VTermScreenCell* cells, void* user) {
+int Terminal::termSbPushline(int cols, const VTermScreenCell* cells, int continuation, void* user) {
     auto* term = static_cast<Terminal*>(user);
-    term->invokePushScrollbackLine(cols, cells);
+    term->invokePushScrollbackLine(cols, cells, continuation);
     return 1;
 }
 
-int Terminal::termSbPopline(int cols, VTermScreenCell* cells, void* user) {
+int Terminal::termSbPopline(int cols, VTermScreenCell* cells, int *continuation, void* user) {
     auto* term = static_cast<Terminal*>(user);
-    return term->invokePopScrollbackLine(cols, cells);
+    return term->invokePopScrollbackLine(cols, cells, continuation);
 }
 
 void Terminal::termOutput(const char* s, size_t len, void* user) {
@@ -754,7 +768,7 @@ void Terminal::invokeBell() {
     env->CallIntMethod(mCallbacks, mBellMethod);
 }
 
-void Terminal::invokePushScrollbackLine(int cols, const VTermScreenCell* cells) {
+void Terminal::invokePushScrollbackLine(int cols, const VTermScreenCell* cells, int continuation) {
     if (!mPushScrollbackMethod) {
         return;
     }
@@ -771,7 +785,7 @@ void Terminal::invokePushScrollbackLine(int cols, const VTermScreenCell* cells) 
         const VTermScreenCell& cell = cells[i];
 
         // Get the primary character and handle surrogate pairs
-        jchar primaryChar = ' ';
+        jchar primaryChar = 0;
         jobject combiningList = env->NewObject(mArrayListClass, mArrayListConstructor);
 
         if (cell.chars[0] != 0) {
@@ -862,14 +876,15 @@ void Terminal::invokePushScrollbackLine(int cols, const VTermScreenCell* cells) 
         env->DeleteLocalRef(screenCells[i]);
     }
 
-    // Call the Java callback with actual cell count
-    env->CallIntMethod(mCallbacks, mPushScrollbackMethod, actualCells, actualCellArray);
+    // Call the Java callback with the screen column count and continuation flag
+    env->CallIntMethod(mCallbacks, mPushScrollbackMethod, cols, actualCellArray,
+        (jboolean)(continuation ? JNI_TRUE : JNI_FALSE));
 
     // Clean up only the array (classes are cached globally)
     env->DeleteLocalRef(actualCellArray);
 }
 
-int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells) {
+int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *continuation) {
     if (!mPopScrollbackMethod) {
         return 0;
     }
@@ -895,6 +910,7 @@ int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells) {
     }
 
     // Call the Java callback to fill the array
+    // Return value: 0=no data, 1=data (not continuation), 2=data (continuation)
     jint result = env->CallIntMethod(mCallbacks, mPopScrollbackMethod, cols, cellArray);
 
     if (result == 0) {
@@ -902,6 +918,11 @@ int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells) {
         env->DeleteLocalRef(cellArray);
         env->DeleteLocalRef(screenCellClass);
         return 0;
+    }
+
+    // Extract continuation flag from return value
+    if (continuation) {
+        *continuation = (result == 2) ? 1 : 0;
     }
 
     // Get field IDs for ScreenCell
@@ -990,6 +1011,25 @@ int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells) {
         cell.attrs.reverse = env->GetBooleanField(screenCell, reverseField);
         cell.attrs.strike = env->GetBooleanField(screenCell, strikeField);
         cell.width = env->GetIntField(screenCell, widthField);
+
+        // Wide character: write a proper placeholder into the next column so
+        // the sb_buffer matches libvterm's native screen format.  Kotlin's
+        // compacted storage skips placeholders, leaving the next slot null.
+        // Without this, any code that iterates sb_buffer column-by-column
+        // (rather than by width) would see a stale/empty cell instead of a
+        // wide-char continuation marker.
+        if (cell.width == 2 && (i + 1) < cols) {
+            VTermScreenCell& placeholder = cells[i + 1];
+            placeholder.chars[0] = (uint32_t)-1;
+            for (int j = 1; j < VTERM_MAX_CHARS_PER_CELL; j++) {
+                placeholder.chars[j] = 0;
+            }
+            placeholder.width = 1;
+            placeholder.attrs = cell.attrs;
+            placeholder.fg = cell.fg;
+            placeholder.bg = cell.bg;
+            i++;  // skip the placeholder column we just filled
+        }
 
         env->DeleteLocalRef(screenCell);
     }
@@ -1196,6 +1236,13 @@ Java_org_connectbot_terminal_TerminalNative_nativeSetDefaultColors(JNIEnv* /* en
                                                                    jlong ptr, jint fgColor, jint bgColor) {
     auto* term = reinterpret_cast<Terminal*>(ptr);
     return term->setDefaultColors(static_cast<uint32_t>(fgColor), static_cast<uint32_t>(bgColor));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeGetLineContinuation(JNIEnv* /* env */, jobject /* thiz */,
+                                                                     jlong ptr, jint row) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    return term->getLineContinuation(row);
 }
 
 } // extern "C"

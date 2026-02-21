@@ -28,7 +28,9 @@ internal data class TerminalLine(
     val row: Int,
     val cells: List<Cell>,
     val lastModified: Long = System.nanoTime(),
-    val semanticSegments: List<SemanticSegment> = emptyList()
+    val semanticSegments: List<SemanticSegment> = emptyList(),
+    val colsAtCapture: Int = -1,
+    val continuation: Boolean = false
 ) {
     /**
      * Get the text content of this line as a string.
@@ -36,7 +38,7 @@ internal data class TerminalLine(
     val text: String by lazy {
         buildString {
             cells.forEach { cell ->
-                append(cell.char)
+                append(if (cell.char == '\u0000') ' ' else cell.char)
                 cell.combiningChars.forEach { append(it) }
             }
         }
@@ -115,7 +117,8 @@ internal data class TerminalLine(
                         fgColor = defaultFg,
                         bgColor = defaultBg
                     )
-                }
+                },
+                colsAtCapture = cols
             )
         }
     }

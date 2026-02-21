@@ -40,6 +40,9 @@ public:
     // Cell data retrieval for rendering
     int getCellRun(JNIEnv* env, int row, int col, jobject runObject);
 
+    // Line info queries
+    bool getLineContinuation(int row);
+
     // Color configuration
     int setPaletteColors(const uint32_t* colors, int count);
     int setDefaultColors(uint32_t fgColor, uint32_t bgColor);
@@ -51,8 +54,8 @@ private:
     static int termMovecursor(VTermPos pos, VTermPos oldpos, int visible, void* user);
     static int termSettermprop(VTermProp prop, VTermValue* val, void* user);
     static int termBell(void* user);
-    static int termSbPushline(int cols, const VTermScreenCell* cells, void* user);
-    static int termSbPopline(int cols, VTermScreenCell* cells, void* user);
+    static int termSbPushline(int cols, const VTermScreenCell* cells, int continuation, void* user);
+    static int termSbPopline(int cols, VTermScreenCell* cells, int *continuation, void* user);
 
     // libvterm output callback (keyboard generates this)
     static void termOutput(const char* s, size_t len, void* user);
@@ -70,8 +73,8 @@ private:
     void invokeMoveCursor(int row, int col, int oldRow, int oldCol, bool visible);
     void invokeSetTermProp(VTermProp prop, VTermValue* val);
     void invokeBell();
-    void invokePushScrollbackLine(int cols, const VTermScreenCell* cells);
-    int invokePopScrollbackLine(int cols, VTermScreenCell* cells);
+    void invokePushScrollbackLine(int cols, const VTermScreenCell* cells, int continuation);
+    int invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *continuation);
     void invokeKeyboardOutput(const char* data, size_t len);
     int invokeOscSequence(int command, const std::string& payload, int cursorRow, int cursorCol);
 

@@ -211,7 +211,10 @@ static void sb_pushline_from_row(VTermScreen *screen, int row)
   for(pos.col = 0; pos.col < screen->cols; pos.col++)
     vterm_screen_get_cell(screen, pos, screen->sb_buffer + pos.col);
 
-  (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, screen->cbdata);
+  const VTermLineInfo *info = vterm_state_get_lineinfo(screen->state, row);
+  int continuation = (info && info->continuation) ? 1 : 0;
+
+  (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, continuation, screen->cbdata);
 }
 
 static int moverect_internal(VTermRect dest, VTermRect src, void *user)
@@ -534,7 +537,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
   while(old_row >= 0) {
     int old_row_end = old_row;
     /* TODO: Stop if dwl or dhl */
-    while(REFLOW && old_lineinfo && old_row >= 0 && old_lineinfo[old_row].continuation)
+    while(REFLOW && old_lineinfo && old_row > 0 && old_lineinfo[old_row].continuation)
       old_row--;
     int old_row_start = old_row;
 
@@ -549,8 +552,47 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
     if(final_blank_row == (new_row + 1) && width == 0)
       final_blank_row = new_row;
 
+    /* Compute effective width accounting for wide chars that would split at
+     * new row boundaries. Each such split requires a padding cell, increasing
+     * the total number of cells (and potentially rows) needed.
+     */
+    int effective_width = width;
+    if(REFLOW && width > 0 && new_cols >= 2) {
+      int sim_col = 0;
+      int sim_src_row = old_row_start;
+      int sim_src_col = 0;
+      int remaining = width;
+      while(remaining > 0) {
+        if(sim_col == new_cols - 1) {
+          ScreenCell *src = &old_buffer[sim_src_row * old_cols + sim_src_col];
+          int next_col = sim_src_col + 1;
+          int next_row = sim_src_row;
+          if(next_col >= old_cols) {
+            next_col = 0;
+            next_row++;
+          }
+          if(src->chars[0] != 0 && src->chars[0] != (uint32_t)-1 &&
+             next_row <= old_row_end && next_col < old_cols &&
+             old_buffer[next_row * old_cols + next_col].chars[0] == (uint32_t)-1) {
+            effective_width++;
+            sim_col = 0;
+            continue; /* Don't advance source — wide char goes to next row */
+          }
+        }
+        sim_src_col++;
+        if(sim_src_col >= old_cols) {
+          sim_src_col = 0;
+          sim_src_row++;
+        }
+        sim_col++;
+        if(sim_col >= new_cols)
+          sim_col = 0;
+        remaining--;
+      }
+    }
+
     int new_height = REFLOW
-      ? width ? (width + new_cols - 1) / new_cols : 1
+      ? effective_width ? (effective_width + new_cols - 1) / new_cols : 1
       : 1;
 
     int new_row_end = new_row;
@@ -612,6 +654,28 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       int new_col = 0;
 
       while(count) {
+        /* Check if a wide character base would be split at the row boundary.
+         * If so, pad the last column and defer the wide char to the next row.
+         */
+        if(REFLOW && new_cols >= 2 && new_col == new_cols - 1) {
+          ScreenCell *src = &old_buffer[old_row * old_cols + old_col];
+          int next_src_col = old_col + 1;
+          int next_src_row = old_row;
+          if(next_src_col >= old_cols) {
+            next_src_col = 0;
+            next_src_row++;
+          }
+          if(src->chars[0] != 0 && src->chars[0] != (uint32_t)-1 &&
+             next_src_row <= old_row_end && next_src_col < old_cols &&
+             old_buffer[next_src_row * old_cols + next_src_col].chars[0] == (uint32_t)-1) {
+            clearcell(screen, &new_buffer[new_row * new_cols + new_col]);
+            new_col++;
+            count--;
+            width++; /* Content cell not consumed, return to width pool */
+            continue;
+          }
+        }
+
         /* TODO: This could surely be done a lot faster by memcpy()'ing the entire range */
         new_buffer[new_row * new_cols + new_col] = old_buffer[old_row * old_cols + old_col];
 
@@ -677,8 +741,11 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       screen->callbacks && screen->callbacks->sb_popline) {
     /* Try to backfill rows by popping scrollback buffer */
     while(new_row >= 0) {
-      if(!(screen->callbacks->sb_popline(old_cols, screen->sb_buffer, screen->cbdata)))
+      int sb_continuation = 0;
+      if(!(screen->callbacks->sb_popline(old_cols, screen->sb_buffer, &sb_continuation, screen->cbdata)))
         break;
+
+      new_lineinfo[new_row].continuation = sb_continuation;
 
       VTermPos pos = { .row = new_row };
       for(pos.col = 0; pos.col < old_cols && pos.col < new_cols; pos.col += screen->sb_buffer[pos.col].width) {

@@ -569,7 +569,7 @@ static int screen_damage(VTermRect rect, void *user)
 }
 
 static int want_screen_scrollback = 0;
-static int screen_sb_pushline(int cols, const VTermScreenCell *cells, void *user)
+static int screen_sb_pushline(int cols, const VTermScreenCell *cells, int continuation, void *user)
 {
   if(!want_screen_scrollback)
     return 1;
@@ -578,7 +578,10 @@ static int screen_sb_pushline(int cols, const VTermScreenCell *cells, void *user
   while(eol && !cells[eol-1].chars[0])
     eol--;
 
-  printf("sb_pushline %d =", cols);
+  if(continuation)
+    printf("sb_pushline %d cont =", cols);
+  else
+    printf("sb_pushline %d =", cols);
   for(int c = 0; c < eol; c++)
     printf(" %02X", cells[c].chars[0]);
   printf("\n");
@@ -586,7 +589,7 @@ static int screen_sb_pushline(int cols, const VTermScreenCell *cells, void *user
   return 1;
 }
 
-static int screen_sb_popline(int cols, VTermScreenCell *cells, void *user)
+static int screen_sb_popline(int cols, VTermScreenCell *cells, int *continuation, void *user)
 {
   if(!want_screen_scrollback)
     return 0;
@@ -600,6 +603,9 @@ static int screen_sb_popline(int cols, VTermScreenCell *cells, void *user)
 
     cells[col].width = 1;
   }
+
+  if(continuation)
+    *continuation = 0;
 
   printf("sb_popline %d\n", cols);
   return 1;

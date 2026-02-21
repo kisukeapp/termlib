@@ -538,8 +538,8 @@ typedef struct {
   int (*settermprop)(VTermProp prop, VTermValue *val, void *user);
   int (*bell)(void *user);
   int (*resize)(int rows, int cols, void *user);
-  int (*sb_pushline)(int cols, const VTermScreenCell *cells, void *user);
-  int (*sb_popline)(int cols, VTermScreenCell *cells, void *user);
+  int (*sb_pushline)(int cols, const VTermScreenCell *cells, int continuation, void *user);
+  int (*sb_popline)(int cols, VTermScreenCell *cells, int *continuation, void *user);
   int (*sb_clear)(void* user);
 } VTermScreenCallbacks;
 
