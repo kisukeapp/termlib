@@ -76,7 +76,8 @@ class SelectionControllerTest {
 
             override fun copySelection(): String {
                 val snapshot = createTestSnapshot()
-                val text = selectionManager.getSelectedText(snapshot, 0)
+                // topLineIndex = scrollback.size (0) since test has no scrollback
+                val text = selectionManager.getSelectedText(snapshot, snapshot.scrollback.size)
                 if (text.isNotEmpty()) {
                     copiedText = text
                     selectionManager.clearSelection()

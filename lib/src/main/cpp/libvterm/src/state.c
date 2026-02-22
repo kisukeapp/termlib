@@ -109,24 +109,8 @@ INTERNAL void vterm_state_free(VTermState *state)
   vterm_allocator_free(state->vt, state);
 }
 
-static void scroll(VTermState *state, VTermRect rect, int downward, int rightward)
+static void shift_lineinfo(VTermState *state, VTermRect rect, int downward, int rightward)
 {
-  if(!downward && !rightward)
-    return;
-
-  int rows = rect.end_row - rect.start_row;
-  if(downward > rows)
-    downward = rows;
-  else if(downward < -rows)
-    downward = -rows;
-
-  int cols = rect.end_col - rect.start_col;
-  if(rightward > cols)
-    rightward = cols;
-  else if(rightward < -cols)
-    rightward = -cols;
-
-  // Update lineinfo if full line
   if(rect.start_col == 0 && rect.end_col == state->cols && rightward == 0) {
     int height = rect.end_row - rect.start_row - abs(downward);
 
@@ -145,10 +129,35 @@ static void scroll(VTermState *state, VTermRect rect, int downward, int rightwar
         state->lineinfo[row] = (VTermLineInfo){ 0 };
     }
   }
+}
 
-  if(state->callbacks && state->callbacks->scrollrect)
-    if((*state->callbacks->scrollrect)(rect, downward, rightward, state->cbdata))
+static void scroll(VTermState *state, VTermRect rect, int downward, int rightward)
+{
+  if(!downward && !rightward)
+    return;
+
+  int rows = rect.end_row - rect.start_row;
+  if(downward > rows)
+    downward = rows;
+  else if(downward < -rows)
+    downward = -rows;
+
+  int cols = rect.end_col - rect.start_col;
+  if(rightward > cols)
+    rightward = cols;
+  else if(rightward < -cols)
+    rightward = -cols;
+
+  // Shift lineinfo AFTER the scrollrect callback so that sb_pushline_from_row
+  // reads the original (pre-shift) continuation flags for the row being pushed.
+  if(state->callbacks && state->callbacks->scrollrect) {
+    if((*state->callbacks->scrollrect)(rect, downward, rightward, state->cbdata)) {
+      shift_lineinfo(state, rect, downward, rightward);
       return;
+    }
+  }
+
+  shift_lineinfo(state, rect, downward, rightward);
 
   if(state->callbacks)
     vterm_scroll_rect(rect, downward, rightward,

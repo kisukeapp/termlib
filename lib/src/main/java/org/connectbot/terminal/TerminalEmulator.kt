@@ -249,16 +249,16 @@ internal class TerminalEmulatorImpl(
     // Reusable CellRun for fetching cell data
     private val cellRun = CellRun()
 
-    // Resize pop tracking: captures scrollback lines popped during resize
-    // so their semantic segments can be placed on the correct screen rows.
-    // Guarded by damageLock.
-    private var trackResizePops = false
-    private val resizePopLines = mutableListOf<TerminalLine>()
-
     // Current screen lines cache
     private var currentLines = List(initialRows) { row ->
         TerminalLine.empty(row, initialCols, currentDefaultForeground, currentDefaultBackground)
     }
+
+    // Guard resize reflow from scrollback callbacks
+    // Guarded by damageLock.
+    private var resizing = false
+    private var resizePopSnapshot: List<TerminalLine> = emptyList()
+    private var resizePopIndex: Int = -1
 
     // Native terminal instance - MUST be initialized AFTER damageLock and other state
     private val terminalNative by lazy {
@@ -295,111 +295,97 @@ internal class TerminalEmulatorImpl(
         val oldCols = cols
         val colsChanged = newCols != oldCols
 
-        // Before resize: snapshot on-screen lines with libvterm's continuation flags.
+        // Prevent concurrent damage processing during resize.
+        synchronized(damageLock) {
+            resizing = true
+            pendingDamageRegions.clear()
+            damagePosted = false
+        }
+
+        // Before resize: snapshot scrollback + on-screen lines.
         // This must happen before terminalNative.resize() because that call reflows
         // the screen buffer and changes the continuation state.
+        val preResizeScrollback: List<TerminalLine>
         val preResizeScreenLines: List<TerminalLine>
         val currentDefaultFg: Color
         val currentDefaultBg: Color
         synchronized(damageLock) {
             currentDefaultFg = currentDefaultForeground
             currentDefaultBg = currentDefaultBackground
-            preResizeScreenLines = if (colsChanged) {
-                currentLines.mapIndexed { index, line ->
-                    line.copy(
-                        continuation = terminalNative.getLineContinuation(index),
-                        cells = normalizeTrailingBlanks(line.cells, currentDefaultFg, currentDefaultBg)
-                    )
+            preResizeScrollback = scrollback
+            preResizeScreenLines = currentLines.mapIndexed { index, line ->
+                val cells = if (colsChanged) {
+                    normalizeTrailingBlanks(line.cells, currentDefaultFg, currentDefaultBg)
+                } else {
+                    line.cells
                 }
-            } else {
-                emptyList()
+                line.copy(cells = cells)
             }
-
-            // Enable pop tracking so popScrollbackLine captures popped lines
-            resizePopLines.clear()
-            trackResizePops = true
+            resizePopSnapshot = preResizeScrollback
+            resizePopIndex = resizePopSnapshot.size - 1
+            pendingDamageRegions.clear()
+            damagePosted = false
         }
 
         rows = newRows
         cols = newCols
         terminalNative.resize(newRows, newCols)
 
-        // Collect popped lines and stop tracking
-        val poppedLines: List<TerminalLine>
         synchronized(damageLock) {
-            trackResizePops = false
-            poppedLines = resizePopLines.toList()
-            resizePopLines.clear()
-        }
-
-        synchronized(damageLock) {
-            // Reflow scrollback
-            if (colsChanged && scrollback.isNotEmpty()) {
-                val reflowed = reflowScrollback(
-                    lines = scrollback,
+            val combinedLines = preResizeScrollback + preResizeScreenLines
+            val reflowed = if (colsChanged) {
+                reflowLines(
+                    lines = combinedLines,
                     newCols = newCols,
                     defaultFg = currentDefaultFg,
                     defaultBg = currentDefaultBg
                 )
-                scrollback.clear()
-                scrollback.addAll(reflowed)
-                scrollbackDirty = true
-            }
-
-            if (colsChanged) {
-                // Width changed: reflow both on-screen and popped segments
-                val reflowedScreen = if (preResizeScreenLines.isNotEmpty()) {
-                    reflowScrollback(
-                        lines = preResizeScreenLines,
-                        newCols = newCols,
-                        defaultFg = currentDefaultFg,
-                        defaultBg = currentDefaultBg
-                    )
-                } else {
-                    emptyList()
-                }
-
-                // Popped lines are in callback order (highest row first, descending).
-                // Reverse to get top-to-bottom order, then reflow at new width.
-                val reflowedPops = if (poppedLines.isNotEmpty()) {
-                    reflowScrollback(
-                        lines = poppedLines.reversed(),
-                        newCols = newCols,
-                        defaultFg = currentDefaultFg,
-                        defaultBg = currentDefaultBg
-                    )
-                } else {
-                    emptyList()
-                }
-
-                currentLines = distributeReflowedSegments(
-                    newRows, newCols, reflowedScreen, reflowedPops,
-                    currentDefaultFg, currentDefaultBg
-                )
             } else {
-                // Only row count changed: preserve segments by row index,
-                // placing popped scrollback segments at the top
-                val oldLines = currentLines
-                // Pops fill from below the reflowed content upward, so reversed
-                // gives top-to-bottom order
-                val popsTopToBottom = poppedLines.reversed()
+                combinedLines
+            }
 
-                currentLines = List(newRows) { row ->
-                    val segments = when {
-                        row < popsTopToBottom.size ->
-                            popsTopToBottom[row].semanticSegments
-                        row < oldLines.size ->
-                            oldLines[row].semanticSegments
-                        else -> emptyList()
-                    }
+            // Split into scrollback (top) and screen (bottom)
+            val screenLineCount = reflowed.size.coerceAtMost(newRows)
+            val screenStart = newRows - screenLineCount
+            val screenLines = if (screenLineCount > 0) {
+                reflowed.takeLast(screenLineCount)
+            } else {
+                emptyList()
+            }
+
+            val newScrollback = if (reflowed.size > newRows) {
+                reflowed.dropLast(newRows)
+            } else {
+                emptyList()
+            }
+
+            val boundedScrollback = if (newScrollback.size > maxScrollbackLines) {
+                newScrollback.takeLast(maxScrollbackLines)
+            } else {
+                newScrollback
+            }
+
+            scrollback.clear()
+            scrollback.addAll(boundedScrollback)
+            scrollbackDirty = true
+
+            currentLines = List(newRows) { row ->
+                if (row >= screenStart && (row - screenStart) in screenLines.indices) {
+                    screenLines[row - screenStart].copy(row = row)
+                } else {
                     TerminalLine.empty(row, newCols, currentDefaultFg, currentDefaultBg)
-                        .copy(semanticSegments = segments)
                 }
             }
+            resizePopSnapshot = emptyList()
+            resizePopIndex = -1
+            pendingDamageRegions.clear()
+            damagePosted = false
+            resizing = false
         }
 
-        // Rebuild all lines after resize
-        invalidateDisplay()
+        // Emit snapshot directly to avoid overwriting reflowed content with libvterm state.
+        val newSnapshot = buildSnapshot()
+        _snapshot.value = newSnapshot
 
         // Resize callback - post to handler to avoid blocking native thread
         handler.post {
@@ -582,6 +568,10 @@ internal class TerminalEmulatorImpl(
     }
 
     override fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>, continuation: Boolean): Int {
+        // During resize we reconstruct scrollback from snapshots; ignore pushes.
+        if (resizing) {
+            return 0
+        }
         // Convert ScreenCell array to TerminalLine
         val cellList = cells.map { screenCell ->
             TerminalLine.Cell(
@@ -649,16 +639,16 @@ internal class TerminalEmulatorImpl(
 
     override fun popScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int {
         synchronized(damageLock) {
-            if (scrollback.isEmpty()) return 0
-
-            // Pop the most recently pushed line (LIFO order)
-            val line = scrollback.removeAt(scrollback.size - 1)
-            scrollbackDirty = true
-
-            // During resize, track popped lines so their segments can be placed
-            // on the correct screen rows after reflow
-            if (trackResizePops) {
-                resizePopLines.add(line)
+            val line = if (resizing) {
+                if (resizePopIndex < 0) return 0
+                val snapshotLine = resizePopSnapshot[resizePopIndex]
+                resizePopIndex--
+                snapshotLine
+            } else {
+                if (scrollback.isEmpty()) return 0
+                val popped = scrollback.removeAt(scrollback.size - 1)
+                scrollbackDirty = true
+                popped
             }
 
             // Expand cells back to column-indexed positions.
@@ -806,6 +796,13 @@ internal class TerminalEmulatorImpl(
         val damageRegions: List<DamageRegion>
         val needsUpdate: Boolean
         synchronized(damageLock) {
+            if (resizing) {
+                pendingDamageRegions.clear()
+                damagePosted = false
+                cursorMoved = false
+                propertyChanged = false
+                return
+            }
             damageRegions = pendingDamageRegions.toList()
             pendingDamageRegions.clear()
             damagePosted = false
@@ -986,7 +983,8 @@ internal class TerminalEmulatorImpl(
                     row,
                     cells,
                     semanticSegments = existingSegments,
-                    colsAtCapture = cols
+                    colsAtCapture = cols,
+                    continuation = terminalNative.getLineContinuation(row)
                 )
             }
         }
@@ -1039,7 +1037,7 @@ internal class TerminalEmulatorImpl(
         }
     }
 
-    private fun reflowScrollback(
+    private fun reflowLines(
         lines: List<TerminalLine>,
         newCols: Int,
         defaultFg: Color,
@@ -1072,11 +1070,23 @@ internal class TerminalEmulatorImpl(
             logicalWidth = 0
         }
 
-        for (line in lines) {
-            val trimmedCells = trimTrailingBlankCells(line.cells)
-            val lineWidth = cellsWidth(trimmedCells)
+        for (i in lines.indices) {
+            val line = lines[i]
+            val nextIsContinuation = i + 1 < lines.size && lines[i + 1].continuation
 
-            if (trimmedCells.isEmpty()) {
+            // Preserve full width for lines that are followed by a continuation.
+            val lineCells = if (nextIsContinuation) {
+                line.cells
+            } else {
+                trimTrailingBlankCells(line.cells)
+            }
+            val lineWidth = cellsWidth(lineCells)
+
+            if (lineCells.isEmpty()) {
+                if (line.continuation) {
+                    // Empty continuation row: contributes no content, skip it.
+                    continue
+                }
                 flushLogicalLine()
                 result.add(blankLine(newCols, defaultFg, defaultBg))
                 continue
@@ -1088,7 +1098,7 @@ internal class TerminalEmulatorImpl(
             }
 
             val offset = logicalWidth
-            logicalCells.addAll(trimmedCells)
+            logicalCells.addAll(lineCells)
             if (line.semanticSegments.isNotEmpty()) {
                 for (segment in line.semanticSegments) {
                     logicalSegments.add(
@@ -1104,11 +1114,7 @@ internal class TerminalEmulatorImpl(
 
         flushLogicalLine()
 
-        return if (result.size > maxScrollbackLines) {
-            result.takeLast(maxScrollbackLines)
-        } else {
-            result
-        }
+        return result
     }
 
     private fun wrapLogicalLine(
@@ -1234,53 +1240,6 @@ internal class TerminalEmulatorImpl(
     }
 
     /**
-     * Distribute reflowed on-screen and popped scrollback segments across new screen rows.
-     *
-     * Layout (top to bottom):
-     *   1. Empty rows (if any remain unfilled)
-     *   2. Popped scrollback content (fills from just above on-screen content, upward)
-     *   3. Reflowed on-screen content (aligned to bottom of screen)
-     */
-    private fun distributeReflowedSegments(
-        newRows: Int,
-        newCols: Int,
-        reflowedScreen: List<TerminalLine>,
-        reflowedPops: List<TerminalLine>,
-        defaultFg: Color,
-        defaultBg: Color
-    ): List<TerminalLine> {
-        // On-screen content anchors to the bottom. If there are more reflowed
-        // lines than screen rows, skip the top ones (they were pushed to
-        // scrollback via sb_pushline callbacks during resize).
-        val screenLineCount = reflowedScreen.size.coerceAtMost(newRows)
-        val screenSkip = (reflowedScreen.size - newRows).coerceAtLeast(0)
-        val screenStart = newRows - screenLineCount
-
-        // Popped content fills from just above the on-screen content, upward.
-        val popLineCount = reflowedPops.size.coerceAtMost(screenStart)
-        val popSkip = (reflowedPops.size - screenStart).coerceAtLeast(0)
-        val popStart = screenStart - popLineCount
-
-        return List(newRows) { row ->
-            val segments = when {
-                row >= screenStart -> {
-                    val idx = screenSkip + (row - screenStart)
-                    if (idx in reflowedScreen.indices) reflowedScreen[idx].semanticSegments
-                    else emptyList()
-                }
-                row >= popStart -> {
-                    val idx = popSkip + (row - popStart)
-                    if (idx in reflowedPops.indices) reflowedPops[idx].semanticSegments
-                    else emptyList()
-                }
-                else -> emptyList()
-            }
-            TerminalLine.empty(row, newCols, defaultFg, defaultBg)
-                .copy(semanticSegments = segments)
-        }
-    }
-
-    /**
      * Convert trailing default-blank cells (space char with default colors and no attrs)
      * to null-char cells so that [trimTrailingBlankCells] can trim them correctly.
      *
@@ -1323,6 +1282,9 @@ internal class TerminalEmulatorImpl(
      * MUST be called with damageLock held.
      */
     private fun addDamageRegion(startRow: Int, endRow: Int, startCol: Int, endCol: Int) {
+        if (resizing) {
+            return
+        }
         // If list is getting large, coalesce more aggressively
         if (pendingDamageRegions.size > 100) {
             // Just mark entire screen as damaged to avoid O(n²) coalescing

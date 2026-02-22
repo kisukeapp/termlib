@@ -509,6 +509,12 @@ fun TerminalWithAccessibility(
     // Scroll animation state
     val scrollOffset = remember(terminalEmulator) { Animatable(0f) }
 
+    // Tracks the absolute index of the first visible line in the combined
+    // scrollback+screen buffer.  Updated each composition from ScrollInfo so
+    // that the SelectionController (defined before scroll-info is computed)
+    // can read the correct value at copy time.
+    var topLineIndexState by remember(terminalEmulator) { mutableStateOf(0) }
+
     // Selection manager
     val selectionManager = remember(terminalEmulator) {
         SelectionManager()
@@ -562,7 +568,7 @@ fun TerminalWithAccessibility(
             }
 
             override fun copySelection(): String {
-                val text = selectionManager.getSelectedText(screenState.snapshot, screenState.scrollbackPosition)
+                val text = selectionManager.getSelectedText(screenState.snapshot, topLineIndexState)
                 if (text.isNotEmpty()) {
                     clipboardManager.setText(AnnotatedString(text))
                     selectionManager.clearSelection()
@@ -636,6 +642,7 @@ fun TerminalWithAccessibility(
         hasExtraTopLine = scrollRemainder > 0f
     )
     val scrollInfoState = rememberUpdatedState(scrollInfo)
+    topLineIndexState = scrollInfo.topLineIndex
 
     Box(
         modifier = modifier
@@ -1258,7 +1265,7 @@ fun TerminalWithAccessibility(
                     FloatingActionButton(
                         onClick = {
                             val selectedText =
-                                selectionManager.getSelectedText(screenState.snapshot, screenState.scrollbackPosition)
+                                selectionManager.getSelectedText(screenState.snapshot, scrollInfoState.value.topLineIndex)
                             clipboardManager.setText(AnnotatedString(selectedText))
                             selectionManager.clearSelection()
                         },
