@@ -474,6 +474,7 @@ int  vterm_state_set_termprop(VTermState *state, VTermProp prop, VTermValue *val
 void vterm_state_focus_in(VTermState *state);
 void vterm_state_focus_out(VTermState *state);
 const VTermLineInfo *vterm_state_get_lineinfo(const VTermState *state, int row);
+void vterm_state_set_line_continuation(VTermState *state, int row, int continuation);
 
 /**
  * Makes sure that the given color `col` is indeed an RGB colour. After this

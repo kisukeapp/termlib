@@ -30,14 +30,28 @@ internal data class TerminalLine(
     val lastModified: Long = System.nanoTime(),
     val semanticSegments: List<SemanticSegment> = emptyList(),
     val colsAtCapture: Int = -1,
-    val continuation: Boolean = false
+    val continuation: Boolean = false,
+    // True if this line was produced by Kotlin reflow (synthetic), not directly from libvterm.
+    val synthetic: Boolean = false
 ) {
     /**
      * Get the text content of this line as a string.
      */
     val text: String by lazy {
+        var lastContent = cells.size - 1
+        while (lastContent >= 0) {
+            val cell = cells[lastContent]
+            if (cell.char != '\u0000' || cell.combiningChars.isNotEmpty()) {
+                break
+            }
+            lastContent--
+        }
+        if (lastContent < 0) {
+            return@lazy ""
+        }
         buildString {
-            cells.forEach { cell ->
+            for (i in 0..lastContent) {
+                val cell = cells[i]
                 append(if (cell.char == '\u0000') ' ' else cell.char)
                 cell.combiningChars.forEach { append(it) }
             }

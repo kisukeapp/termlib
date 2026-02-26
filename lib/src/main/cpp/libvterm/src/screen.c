@@ -500,8 +500,14 @@ static int bell(void *user)
 static int line_popcount(ScreenCell *buffer, int row, int rows, int cols)
 {
   int col = cols - 1;
-  while(col >= 0 && buffer[row * cols + col].chars[0] == 0)
-    col--;
+  while(col >= 0) {
+    ScreenCell *cell = &buffer[row * cols + col];
+    if(cell->chars[0] == 0) {
+      col--;
+      continue;
+    }
+    break;
+  }
   return col + 1;
 }
 
@@ -520,6 +526,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
 
   int old_row = old_rows - 1;
   int new_row = new_rows - 1;
+  int break_old_row_end = -1;
 
   VTermPos old_cursor = statefields->pos;
   VTermPos new_cursor = { -1, -1 };
@@ -540,13 +547,17 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
     while(REFLOW && old_lineinfo && old_row > 0 && old_lineinfo[old_row].continuation)
       old_row--;
     int old_row_start = old_row;
+    int continued_from_scrollback = 0;
+    if(REFLOW && bufidx == BUFIDX_PRIMARY && old_lineinfo &&
+       old_row_start == 0 && old_lineinfo[old_row_start].continuation)
+      continued_from_scrollback = 1;
 
     int width = 0;
     for(int row = old_row_start; row <= old_row_end; row++) {
-      if(REFLOW && row < (old_rows - 1) && old_lineinfo[row + 1].continuation)
-        width += old_cols;
-      else
-        width += line_popcount(old_buffer, row, old_rows, old_cols);
+      /* Always use the true content width. Even for continuation lines, using
+       * full old_cols preserves padding spaces and causes gaps when unwrapping.
+       */
+      width += line_popcount(old_buffer, row, old_rows, old_cols);
     }
 
     if(final_blank_row == (new_row + 1) && width == 0)
@@ -644,6 +655,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         if(new_cursor.col >= new_cols)
           new_cursor.col = new_cols-1;
       }
+      break_old_row_end = old_row_end;
       break;
     }
 
@@ -652,8 +664,19 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       width -= count;
 
       int new_col = 0;
+      int row_width = REFLOW ? line_popcount(old_buffer, old_row, old_rows, old_cols) : old_cols;
 
       while(count) {
+        if(REFLOW) {
+          while(old_col >= row_width && old_row < old_row_end) {
+            old_row++;
+            old_col = 0;
+            row_width = line_popcount(old_buffer, old_row, old_rows, old_cols);
+          }
+          if(old_col >= row_width) {
+            break;
+          }
+        }
         /* Check if a wide character base would be split at the row boundary.
          * If so, pad the last column and defer the wide char to the next row.
          */
@@ -691,6 +714,8 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
             break;
           }
           old_col = 0;
+          if(REFLOW && old_row <= old_row_end)
+            row_width = line_popcount(old_buffer, old_row, old_rows, old_cols);
         }
 
         new_col++;
@@ -708,7 +733,8 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         new_col++;
       }
 
-      new_lineinfo[new_row].continuation = (new_row > new_row_start);
+      new_lineinfo[new_row].continuation =
+        (new_row > new_row_start) || (continued_from_scrollback && new_row == new_row_start);
     }
 
     old_row = old_row_start - 1;
@@ -730,25 +756,35 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
   }
 
   if(old_row >= 0 && bufidx == BUFIDX_PRIMARY) {
-    /* Push spare lines to scrollback buffer */
+    /* Push spare lines to scrollback buffer.
+     * When the loop broke because a continuation group didn't fit,
+     * old_row is the group START but the group END may be higher.
+     * Push through the group end to avoid losing continuation rows.
+     */
+    int push_upto = (break_old_row_end > old_row) ? break_old_row_end : old_row;
     if(screen->callbacks && screen->callbacks->sb_pushline)
-      for(int row = 0; row <= old_row; row++)
+      for(int row = 0; row <= push_upto; row++)
         sb_pushline_from_row(screen, row);
     if(active)
-      statefields->pos.row -= (old_row + 1);
+      statefields->pos.row -= (push_upto + 1);
   }
   if(new_row >= 0 && bufidx == BUFIDX_PRIMARY &&
       screen->callbacks && screen->callbacks->sb_popline) {
-    /* Try to backfill rows by popping scrollback buffer */
+    /* Try to backfill rows by popping scrollback buffer.
+     * When reflow is enabled, popped scrollback lines need to be reflowed
+     * to the NEW column width as well (libvterm does not rewrap them).
+     * Request poplines at new_cols so the embedder can supply reflowed lines.
+     */
+    int pop_cols = (REFLOW && new_cols != old_cols) ? new_cols : old_cols;
     while(new_row >= 0) {
       int sb_continuation = 0;
-      if(!(screen->callbacks->sb_popline(old_cols, screen->sb_buffer, &sb_continuation, screen->cbdata)))
+      if(!(screen->callbacks->sb_popline(pop_cols, screen->sb_buffer, &sb_continuation, screen->cbdata)))
         break;
 
       new_lineinfo[new_row].continuation = sb_continuation;
 
       VTermPos pos = { .row = new_row };
-      for(pos.col = 0; pos.col < old_cols && pos.col < new_cols; pos.col += screen->sb_buffer[pos.col].width) {
+      for(pos.col = 0; pos.col < pop_cols && pos.col < new_cols; pos.col += screen->sb_buffer[pos.col].width) {
         VTermScreenCell *src = &screen->sb_buffer[pos.col];
         ScreenCell *dst = &new_buffer[pos.row * new_cols + pos.col];
 

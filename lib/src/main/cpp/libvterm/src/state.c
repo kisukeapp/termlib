@@ -2262,6 +2262,12 @@ const VTermLineInfo *vterm_state_get_lineinfo(const VTermState *state, int row)
   return state->lineinfo + row;
 }
 
+void vterm_state_set_line_continuation(VTermState *state, int row, int continuation)
+{
+  if(row >= 0 && row < state->rows)
+    state->lineinfo[row].continuation = continuation ? 1 : 0;
+}
+
 void vterm_state_set_selection_callbacks(VTermState *state, const VTermSelectionCallbacks *callbacks, void *user,
     char *buffer, size_t buflen)
 {

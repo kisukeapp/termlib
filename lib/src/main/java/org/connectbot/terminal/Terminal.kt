@@ -396,9 +396,6 @@ fun TerminalWithAccessibility(
     // Cursor blink state
     var cursorBlinkVisible by remember(terminalEmulator) { mutableStateOf(true) }
 
-    // IME text field state (hidden BasicTextField for capturing IME input)
-    val imeFocusRequester = remember { FocusRequester() }
-
     // Review Mode state for accessibility
     var isReviewMode by remember(terminalEmulator) { mutableStateOf(false) }
     val reviewFocusRequester = remember { FocusRequester() }
@@ -455,7 +452,11 @@ fun TerminalWithAccessibility(
             // Exiting Review Mode: return focus to input field if keyboard enabled
             if (keyboardEnabled && shouldShowIme) {
                 delay(UI_SETTLE_DELAY_MS)
-                imeFocusRequester.requestFocus()
+                try {
+                    focusRequester.requestFocus()
+                } catch (_: IllegalStateException) {
+                    // Focus requester not attached yet, ignore
+                }
                 delay(KEYBOARD_SHOW_DELAY_MS)
                 keyboardController?.show()
             }

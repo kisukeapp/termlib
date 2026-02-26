@@ -133,6 +133,11 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
         return nativeGetLineContinuation(nativePtr, row)
     }
 
+    fun setLineContinuation(row: Int, continuation: Boolean) {
+        checkNotClosed()
+        nativeSetLineContinuation(nativePtr, row, continuation)
+    }
+
     /**
      * Set ANSI palette colors (indices 0-15).
      *
@@ -198,6 +203,7 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     private external fun nativeDispatchCharacter(ptr: Long, modifiers: Int, character: Int): Boolean
     private external fun nativeGetCellRun(ptr: Long, row: Int, col: Int, run: CellRun): Int
     private external fun nativeGetLineContinuation(ptr: Long, row: Int): Boolean
+    private external fun nativeSetLineContinuation(ptr: Long, row: Int, continuation: Boolean)
     private external fun nativeSetPaletteColors(ptr: Long, colors: IntArray, count: Int): Int
     private external fun nativeSetDefaultColors(ptr: Long, fgColor: Int, bgColor: Int): Int
 

@@ -42,6 +42,7 @@ public:
 
     // Line info queries
     bool getLineContinuation(int row);
+    void setLineContinuation(int row, bool continuation);
 
     // Color configuration
     int setPaletteColors(const uint32_t* colors, int count);

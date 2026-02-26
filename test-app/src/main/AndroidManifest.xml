@@ -9,6 +9,8 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="screenSize|smallestScreenSize|orientation|screenLayout|keyboard|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.TermScreenTest">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

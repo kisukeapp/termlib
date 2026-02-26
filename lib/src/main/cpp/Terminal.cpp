@@ -310,6 +310,17 @@ bool Terminal::getLineContinuation(int row) {
     return info && info->continuation;
 }
 
+void Terminal::setLineContinuation(int row, bool continuation) {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+
+    if (!mVt || row < 0 || row >= mRows) return;
+
+    VTermState* state = vterm_obtain_state(mVt);
+    if (!state) return;
+
+    vterm_state_set_line_continuation(state, row, continuation ? 1 : 0);
+}
+
 // Color configuration
 int Terminal::setPaletteColors(const uint32_t* colors, int count) {
     std::lock_guard<std::recursive_mutex> lock(mLock);
@@ -438,8 +449,9 @@ int Terminal::getCellRun(JNIEnv* env, int row, int col, jobject runObject) {
 
         // Add character(s) to run
         if (currentCell.chars[0] == 0 || currentCell.chars[0] == (uint32_t)-1) {
-            // Empty cell or orphaned wide-char placeholder
-            chars[runLength++] = ' ';
+            // Empty cell or orphaned wide-char placeholder.
+            // Preserve as NUL so Kotlin can distinguish padding vs real spaces.
+            chars[runLength++] = 0;
         } else {
             // Convert UTF-32 to UTF-16 (handle surrogate pairs)
             for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && currentCell.chars[i]; i++) {
@@ -948,13 +960,23 @@ int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *con
     jclass charClass = env->FindClass("java/lang/Character");
     jmethodID charValue = env->GetMethodID(charClass, "charValue", "()C");
 
+    // Get default colors for null-fill cells. Trimmed scrollback lines have
+    // fewer cells than the requested column count; null slots must use the
+    // terminal's configured default colors so they match the renderer's
+    // background, not hard-coded black which shows as visible rectangles on
+    // non-black themes.
+    VTermState* popState = vterm_obtain_state(mVt);
+    VTermColor popDefaultFg, popDefaultBg;
+    vterm_state_get_default_colors(popState, &popDefaultFg, &popDefaultBg);
+
     // Convert Java ScreenCell array to VTermScreenCell
     for (int i = 0; i < cols; i++) {
         jobject screenCell = env->GetObjectArrayElement(cellArray, i);
         if (!screenCell) {
-            // Initialize empty cell
+            // Initialize empty cell with default colors. Use NUL so libvterm
+            // treats this as trailing padding (not visible content) during reflow.
             VTermScreenCell& cell = cells[i];
-            cell.chars[0] = ' ';
+            cell.chars[0] = 0;
             for (int j = 1; j < VTERM_MAX_CHARS_PER_CELL; j++) {
                 cell.chars[j] = 0;
             }
@@ -964,8 +986,8 @@ int Terminal::invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *con
             cell.attrs.underline = 0;
             cell.attrs.reverse = 0;
             cell.attrs.strike = 0;
-            vterm_color_rgb(&cell.fg, 192, 192, 192);
-            vterm_color_rgb(&cell.bg, 0, 0, 0);
+            cell.fg = popDefaultFg;
+            cell.bg = popDefaultBg;
             continue;
         }
 
@@ -1243,6 +1265,13 @@ Java_org_connectbot_terminal_TerminalNative_nativeGetLineContinuation(JNIEnv* /*
                                                                      jlong ptr, jint row) {
     auto* term = reinterpret_cast<Terminal*>(ptr);
     return term->getLineContinuation(row);
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeSetLineContinuation(JNIEnv* /* env */, jobject /* thiz */,
+                                                                     jlong ptr, jint row, jboolean continuation) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->setLineContinuation(row, continuation);
 }
 
 } // extern "C"

@@ -264,10 +264,14 @@ internal class SelectionManager {
 
                 when (mode) {
                     SelectionMode.LINE -> {
-                        line.cells.forEach { cell ->
-                            append(cell.char)
-                            cell.combiningChars.forEach { append(it) }
-                        }
+                        val lineText = buildString {
+                            line.cells.forEach { cell ->
+                                val ch = if (cell.char == '\u0000') ' ' else cell.char
+                                append(ch)
+                                cell.combiningChars.forEach { append(it) }
+                            }
+                        }.trimEnd { it == ' ' || it == '\u0000' }
+                        append(lineText)
                         if (row < maxRow) append('\n')
                     }
                     SelectionMode.BLOCK -> {
@@ -282,7 +286,8 @@ internal class SelectionManager {
 
                         for (col in startCol..minOf(endCol, line.cells.lastIndex)) {
                             val cell = line.cells[col]
-                            append(cell.char)
+                            val ch = if (cell.char == '\u0000') ' ' else cell.char
+                            append(ch)
                             cell.combiningChars.forEach { append(it) }
                         }
                         if (row < maxRow) append('\n')
