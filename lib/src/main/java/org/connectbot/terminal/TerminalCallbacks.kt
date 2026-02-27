@@ -110,6 +110,40 @@ internal interface TerminalCallbacks {
      * @return 1 if handled, 0 otherwise
      */
     fun onOscSequence(command: Int, payload: String, cursorRow: Int, cursorCol: Int): Int
+
+    /**
+     * Called when synchronized output mode changes (CSI ? 2026 h/l).
+     */
+    fun onSyncOutputChanged(active: Boolean)
+
+    /**
+     * Called when kitty keyboard mode is pushed or popped.
+     *
+     * @param push True for push (CSI > flags u), false for pop (CSI < u)
+     * @param flags The 5-bit flags value (only meaningful on push)
+     */
+    fun onKittyKeyboardChanged(push: Boolean, flags: Int)
+
+    /**
+     * Called when a DCS (Device Control String) sequence is received.
+     * Used for Sixel graphics (DCS 'q' ...) and other DCS commands.
+     *
+     * @param command The DCS command string
+     * @param data The DCS payload data
+     * @param cursorRow Cursor row when DCS started
+     * @param cursorCol Cursor column when DCS started
+     */
+    fun onDcsSequence(command: String, data: String, cursorRow: Int, cursorCol: Int)
+
+    /**
+     * Called when an APC (Application Program Command) sequence is received.
+     * Used for Kitty graphics protocol (_G...).
+     *
+     * @param data The APC payload
+     * @param cursorRow Cursor row when APC started
+     * @param cursorCol Cursor column when APC started
+     */
+    fun onApcSequence(data: String, cursorRow: Int, cursorCol: Int)
 }
 
 /**

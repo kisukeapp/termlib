@@ -49,6 +49,7 @@ internal class KeyboardHandler(
     var selectionController: SelectionController? = null,
     var onInputProcessed: (() -> Unit)? = null
 ) {
+    private val kittyEncoder = KittyKeyboardEncoder()
 
     /**
      * Process a Compose KeyEvent and send to terminal.
@@ -104,6 +105,26 @@ internal class KeyboardHandler(
 
         // Build modifier mask for libvterm (combine sticky + hardware modifiers)
         val modifiers = buildModifierMask(ctrl, alt, shift)
+
+        // When kitty keyboard protocol is active, encode keys as CSI-u sequences
+        if (terminalEmulator.kittyKeyboardActive) {
+            val vtermKey = mapToVTermKey(key)
+            val char = getCharacterFromKey(key, shift || modifierManager?.isShiftActive() == true)
+            val codepoint = vtermKey ?: char?.code ?: return false
+
+            val encoded = kittyEncoder.encode(
+                codepoint = codepoint,
+                modifiers = modifiers,
+                eventType = KittyKeyboardEncoder.EventType.PRESS,
+                flags = KittyKeyboardFlags.DISAMBIGUATE
+            )
+            if (encoded != null) {
+                terminalEmulator.writeInput(encoded)
+                modifierManager?.clearTransients()
+                onInputProcessed?.invoke()
+                return true
+            }
+        }
 
         // Check if this is a special key that libvterm handles
         val vtermKey = mapToVTermKey(key)

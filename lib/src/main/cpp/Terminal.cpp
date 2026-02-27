@@ -86,6 +86,24 @@ Terminal::Terminal(JNIEnv* env, jobject callbacks, int rows, int cols)
     if (!mOscSequenceMethod) {
         LOGE("Failed to find onOscSequence method");
     }
+    mSyncOutputChangedMethod = env->GetMethodID(callbacksClass, "onSyncOutputChanged", "(Z)V");
+    if (!mSyncOutputChangedMethod) {
+        LOGE("Failed to find onSyncOutputChanged method");
+    }
+    mKittyKeyboardChangedMethod = env->GetMethodID(callbacksClass, "onKittyKeyboardChanged", "(ZI)V");
+    if (!mKittyKeyboardChangedMethod) {
+        LOGE("Failed to find onKittyKeyboardChanged method");
+    }
+    mDcsSequenceMethod = env->GetMethodID(callbacksClass, "onDcsSequence",
+        "(Ljava/lang/String;Ljava/lang/String;II)V");
+    if (!mDcsSequenceMethod) {
+        LOGE("Failed to find onDcsSequence method");
+    }
+    mApcSequenceMethod = env->GetMethodID(callbacksClass, "onApcSequence",
+        "(Ljava/lang/String;II)V");
+    if (!mApcSequenceMethod) {
+        LOGE("Failed to find onApcSequence method");
+    }
 
     // Cache CellRun class and field IDs
     mCellRunClass = (jclass)env->NewGlobalRef(
@@ -202,10 +220,10 @@ Terminal::Terminal(JNIEnv* env, jobject callbacks, int rows, int cols)
     VTermState* state = vterm_obtain_state(mVt);
     VTermStateFallbacks fallbacks = {
         .control = nullptr,
-        .csi = nullptr,
+        .csi = termCsiFallback,
         .osc = termOscFallback,
-        .dcs = nullptr,
-        .apc = nullptr,
+        .dcs = termDcsFallback,
+        .apc = termApcFallback,
         .pm = nullptr,
         .sos = nullptr
     };
@@ -418,6 +436,55 @@ bool Terminal::dispatchCharacter(int modifiers, int codepoint) {
 
     vterm_keyboard_unichar(mVt, codepoint, mod);
     return true;
+}
+
+// Mouse input
+void Terminal::mouseMove(int row, int col, int modifiers) {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    vterm_mouse_move(mVt, row, col, buildModifier(modifiers));
+}
+
+void Terminal::mouseButton(int button, bool pressed, int modifiers) {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    vterm_mouse_button(mVt, button, pressed, buildModifier(modifiers));
+}
+
+// Bracketed paste
+void Terminal::startPaste() {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    vterm_keyboard_start_paste(mVt);
+}
+
+void Terminal::endPaste() {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    vterm_keyboard_end_paste(mVt);
+}
+
+// Focus reporting
+void Terminal::focusIn() {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    VTermState* state = vterm_obtain_state(mVt);
+    if (state) vterm_state_focus_in(state);
+}
+
+void Terminal::focusOut() {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    if (!mVt) return;
+    VTermState* state = vterm_obtain_state(mVt);
+    if (state) vterm_state_focus_out(state);
+}
+
+VTermModifier Terminal::buildModifier(int modifiers) {
+    VTermModifier mod = VTERM_MOD_NONE;
+    if (modifiers & 1) mod = (VTermModifier)(mod | VTERM_MOD_SHIFT);
+    if (modifiers & 2) mod = (VTermModifier)(mod | VTERM_MOD_ALT);
+    if (modifiers & 4) mod = (VTermModifier)(mod | VTERM_MOD_CTRL);
+    return mod;
 }
 
 // Cell run retrieval
@@ -654,6 +721,87 @@ int Terminal::termSelectionQuery(VTermSelectionMask mask, void* user) {
     LOGD("termSelectionQuery: mask=%04X (ignored for security)", mask);
     // Return 0 to indicate we don't support clipboard read
     return 0;
+}
+
+// CSI fallback handler - handles unrecognised CSI sequences
+// Detects mode 2026 (synchronized output) and mode 2048 (kitty keyboard)
+int Terminal::termCsiFallback(const char* leader, const long args[], int argcount,
+                              const char* intermed, char command, void* user) {
+    auto* term = static_cast<Terminal*>(user);
+
+    // Detect CSI ? 2026 h/l (synchronized output)
+    if (leader && leader[0] == '?' && (command == 'h' || command == 'l')) {
+        for (int i = 0; i < argcount; i++) {
+            if (args[i] == 2026) {
+                term->invokeSyncOutputChanged(command == 'h');
+                return 1;
+            }
+        }
+    }
+
+    // Detect CSI > flags u (push kitty keyboard mode)
+    if (leader && leader[0] == '>' && command == 'u') {
+        int flags = (argcount > 0) ? (int)args[0] : 0;
+        term->invokeKittyKeyboardChanged(true, flags);
+        return 1;
+    }
+
+    // Detect CSI < u (pop kitty keyboard mode)
+    if (leader && leader[0] == '<' && command == 'u') {
+        term->invokeKittyKeyboardChanged(false, 0);
+        return 1;
+    }
+
+    return 0;
+}
+
+// DCS fallback handler - accumulates fragmented DCS data (for Sixel)
+int Terminal::termDcsFallback(const char* command, size_t commandlen,
+                              VTermStringFragment frag, void* user) {
+    auto* term = static_cast<Terminal*>(user);
+
+    if (frag.initial) {
+        term->mDcsCommand.assign(command, commandlen);
+        term->mDcsData.clear();
+        VTermState* state = vterm_obtain_state(term->mVt);
+        vterm_state_get_cursorpos(state, &term->mDcsCursorPos);
+    }
+
+    if (frag.len > 0) {
+        term->mDcsData.append(frag.str, frag.len);
+    }
+
+    if (frag.final) {
+        term->invokeDcsSequence(term->mDcsCommand, term->mDcsData,
+                                term->mDcsCursorPos.row, term->mDcsCursorPos.col);
+        term->mDcsCommand.clear();
+        term->mDcsData.clear();
+    }
+
+    return 1;
+}
+
+// APC fallback handler - accumulates fragmented APC data (for Kitty graphics)
+int Terminal::termApcFallback(VTermStringFragment frag, void* user) {
+    auto* term = static_cast<Terminal*>(user);
+
+    if (frag.initial) {
+        term->mApcData.clear();
+        VTermState* state = vterm_obtain_state(term->mVt);
+        vterm_state_get_cursorpos(state, &term->mApcCursorPos);
+    }
+
+    if (frag.len > 0) {
+        term->mApcData.append(frag.str, frag.len);
+    }
+
+    if (frag.final) {
+        term->invokeApcSequence(term->mApcData,
+                                term->mApcCursorPos.row, term->mApcCursorPos.col);
+        term->mApcData.clear();
+    }
+
+    return 1;
 }
 
 // Java callback invocations
@@ -1115,6 +1263,53 @@ int Terminal::invokeOscSequence(int command, const std::string& payload, int cur
     return result;
 }
 
+void Terminal::invokeSyncOutputChanged(bool active) {
+    if (!mSyncOutputChangedMethod) return;
+
+    JNIEnv* env;
+    if (mJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+
+    env->CallVoidMethod(mCallbacks, mSyncOutputChangedMethod, (jboolean)active);
+}
+
+void Terminal::invokeKittyKeyboardChanged(bool push, int flags) {
+    if (!mKittyKeyboardChangedMethod) return;
+
+    JNIEnv* env;
+    if (mJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+
+    env->CallVoidMethod(mCallbacks, mKittyKeyboardChangedMethod, (jboolean)push, (jint)flags);
+}
+
+void Terminal::invokeDcsSequence(const std::string& command, const std::string& data,
+                                  int cursorRow, int cursorCol) {
+    if (!mDcsSequenceMethod) return;
+
+    JNIEnv* env;
+    if (mJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+
+    jstring cmdStr = env->NewStringUTF(command.c_str());
+    jstring dataStr = env->NewStringUTF(data.c_str());
+
+    env->CallVoidMethod(mCallbacks, mDcsSequenceMethod, cmdStr, dataStr, cursorRow, cursorCol);
+
+    env->DeleteLocalRef(cmdStr);
+    env->DeleteLocalRef(dataStr);
+}
+
+void Terminal::invokeApcSequence(const std::string& data, int cursorRow, int cursorCol) {
+    if (!mApcSequenceMethod) return;
+
+    JNIEnv* env;
+    if (mJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+
+    jstring dataStr = env->NewStringUTF(data.c_str());
+
+    env->CallVoidMethod(mCallbacks, mApcSequenceMethod, dataStr, cursorRow, cursorCol);
+
+    env->DeleteLocalRef(dataStr);
+}
+
 // Helper functions
 bool Terminal::cellStyleEqual(const VTermScreenCell& a, const VTermScreenCell& b) {
     return memcmp(&a.fg, &b.fg, sizeof(VTermColor)) == 0 &&
@@ -1272,6 +1467,44 @@ Java_org_connectbot_terminal_TerminalNative_nativeSetLineContinuation(JNIEnv* /*
                                                                      jlong ptr, jint row, jboolean continuation) {
     auto* term = reinterpret_cast<Terminal*>(ptr);
     term->setLineContinuation(row, continuation);
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeMouseMove(JNIEnv* /* env */, jobject /* thiz */,
+                                                            jlong ptr, jint row, jint col, jint modifiers) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->mouseMove(row, col, modifiers);
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeMouseButton(JNIEnv* /* env */, jobject /* thiz */,
+                                                              jlong ptr, jint button, jboolean pressed, jint modifiers) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->mouseButton(button, pressed, modifiers);
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeStartPaste(JNIEnv* /* env */, jobject /* thiz */, jlong ptr) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->startPaste();
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeEndPaste(JNIEnv* /* env */, jobject /* thiz */, jlong ptr) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->endPaste();
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeFocusIn(JNIEnv* /* env */, jobject /* thiz */, jlong ptr) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->focusIn();
+}
+
+JNIEXPORT void JNICALL
+Java_org_connectbot_terminal_TerminalNative_nativeFocusOut(JNIEnv* /* env */, jobject /* thiz */, jlong ptr) {
+    auto* term = reinterpret_cast<Terminal*>(ptr);
+    term->focusOut();
 }
 
 } // extern "C"

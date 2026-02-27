@@ -16,6 +16,7 @@
  */
 package org.connectbot.terminal
 
+import android.graphics.Bitmap
 import androidx.compose.ui.graphics.Color
 
 /**
@@ -63,7 +64,11 @@ internal data class TerminalSnapshot(
     val rows: Int,
     val cols: Int,
     val timestamp: Long,
-    val sequenceNumber: Long
+    val sequenceNumber: Long,
+    val mouseMode: MouseMode = MouseMode.NONE,
+    val searchHighlights: List<SearchHighlight> = emptyList(),
+    val imagePlacements: List<ImagePlacement> = emptyList(),
+    val commandLineInfo: CommandLineInfo? = null
 ) {
     companion object {
         /**
@@ -94,3 +99,30 @@ internal data class TerminalSnapshot(
         }
     }
 }
+
+/**
+ * Information about the current command line at a shell prompt.
+ * Extracted by reading terminal buffer cells between the OSC 133 B column and cursor.
+ */
+data class CommandLineInfo(
+    val text: String,
+    val cursorOffset: Int,
+    val promptId: Int
+)
+
+internal data class SearchHighlight(
+    val row: Int,
+    val startCol: Int,
+    val endCol: Int,
+    val isCurrent: Boolean = false
+)
+
+internal data class ImagePlacement(
+    val id: Int,
+    val bitmap: Bitmap,
+    val row: Int,
+    val col: Int,
+    val widthCells: Int,
+    val heightCells: Int,
+    val zIndex: Int = 0
+)

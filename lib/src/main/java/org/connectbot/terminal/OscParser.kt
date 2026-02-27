@@ -83,6 +83,50 @@ internal class OscParser {
             val state: ProgressState,
             val progress: Int
         ) : Action()
+
+        /**
+         * Action to query or set a dynamic color (OSC 10/11/12).
+         */
+        data class QueryColor(
+            val colorType: DynamicColorType
+        ) : Action()
+
+        data class SetDynamicColor(
+            val colorType: DynamicColorType,
+            val red: Int,
+            val green: Int,
+            val blue: Int
+        ) : Action()
+
+        /**
+         * Action to display an inline image (OSC 1337 File=).
+         */
+        data class InlineImage(
+            val params: Map<String, String>,
+            val data: ByteArray,
+            val cursorRow: Int,
+            val cursorCol: Int
+        ) : Action() {
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (other !is InlineImage) return false
+                return params == other.params && data.contentEquals(other.data) &&
+                    cursorRow == other.cursorRow && cursorCol == other.cursorCol
+            }
+            override fun hashCode(): Int {
+                var result = params.hashCode()
+                result = 31 * result + data.contentHashCode()
+                result = 31 * result + cursorRow
+                result = 31 * result + cursorCol
+                return result
+            }
+        }
+    }
+
+    enum class DynamicColorType {
+        FOREGROUND,  // OSC 10
+        BACKGROUND,  // OSC 11
+        CURSOR       // OSC 12
     }
 
     /**
@@ -104,6 +148,7 @@ internal class OscParser {
         return when (command) {
             8 -> handleOsc8(payload, cursorRow, cursorCol)
             9 -> handleOsc9(payload)
+            10, 11, 12 -> handleOscDynamicColor(command, payload)
             52 -> handleOsc52(payload)
             133 -> handleOsc133(payload, cursorRow, cursorCol)
             1337 -> handleOsc1337(payload, cursorRow, cursorCol, cols)
@@ -276,6 +321,66 @@ internal class OscParser {
         return null
     }
 
+    /**
+     * Handle OSC 10/11/12 dynamic color queries and sets.
+     *
+     * Format: OSC 10 ; ? ST  (query foreground color)
+     * Format: OSC 10 ; rgb:RRRR/GGGG/BBBB ST  (set foreground color)
+     * OSC 11 = background, OSC 12 = cursor color
+     */
+    private fun handleOscDynamicColor(command: Int, payload: String): List<Action> {
+        val colorType = when (command) {
+            10 -> DynamicColorType.FOREGROUND
+            11 -> DynamicColorType.BACKGROUND
+            12 -> DynamicColorType.CURSOR
+            else -> return emptyList()
+        }
+
+        if (payload == "?") {
+            return listOf(Action.QueryColor(colorType))
+        }
+
+        // Parse rgb:RRRR/GGGG/BBBB format
+        if (payload.startsWith("rgb:")) {
+            val parts = payload.substring(4).split("/")
+            if (parts.size == 3) {
+                val r = parseColorComponent(parts[0])
+                val g = parseColorComponent(parts[1])
+                val b = parseColorComponent(parts[2])
+                if (r != null && g != null && b != null) {
+                    return listOf(Action.SetDynamicColor(colorType, r, g, b))
+                }
+            }
+        }
+
+        // Parse #RRGGBB format
+        if (payload.startsWith("#") && payload.length == 7) {
+            val r = payload.substring(1, 3).toIntOrNull(16)
+            val g = payload.substring(3, 5).toIntOrNull(16)
+            val b = payload.substring(5, 7).toIntOrNull(16)
+            if (r != null && g != null && b != null) {
+                return listOf(Action.SetDynamicColor(colorType, r, g, b))
+            }
+        }
+
+        return emptyList()
+    }
+
+    /**
+     * Parse an X11 color component (1, 2, 3, or 4 hex digits).
+     * Scales to 0-255 range.
+     */
+    private fun parseColorComponent(hex: String): Int? {
+        val value = hex.toIntOrNull(16) ?: return null
+        return when (hex.length) {
+            1 -> value * 17        // 0x0-0xF -> 0-255
+            2 -> value             // 0x00-0xFF -> 0-255
+            3 -> value shr 4       // 0x000-0xFFF -> 0-255
+            4 -> value shr 8       // 0x0000-0xFFFF -> 0-255
+            else -> null
+        }
+    }
+
     private fun handleOsc133(payload: String, cursorRow: Int, cursorCol: Int): List<Action> {
         val actions = mutableListOf<Action>()
 
@@ -366,7 +471,55 @@ internal class OscParser {
                 }
                 actions.add(Action.SetCursorShape(shape))
             }
+            payload.startsWith("File=") -> {
+                val imageAction = handleOsc1337File(payload.substring(5), cursorRow, cursorCol)
+                if (imageAction != null) {
+                    actions.add(imageAction)
+                }
+            }
         }
         return actions
+    }
+
+    /**
+     * Handle OSC 1337 File= inline image sequence.
+     *
+     * Format: File=[key=value;...]:base64data
+     * Keys: name, size, width, height, preserveAspectRatio, inline
+     */
+    private fun handleOsc1337File(payload: String, cursorRow: Int, cursorCol: Int): Action.InlineImage? {
+        val colonIndex = payload.indexOf(':')
+        if (colonIndex < 0) return null
+
+        val paramsPart = payload.substring(0, colonIndex)
+        val dataPart = payload.substring(colonIndex + 1)
+
+        // Parse key=value pairs
+        val params = mutableMapOf<String, String>()
+        for (param in paramsPart.split(";")) {
+            val eqIndex = param.indexOf('=')
+            if (eqIndex > 0) {
+                params[param.substring(0, eqIndex)] = param.substring(eqIndex + 1)
+            }
+        }
+
+        // Only display inline images (inline=1)
+        if (params["inline"] != "1") return null
+
+        // Decode base64 image data
+        val imageData = try {
+            Base64.Default.decode(dataPart)
+        } catch (e: IllegalArgumentException) {
+            return null
+        }
+
+        if (imageData.isEmpty()) return null
+
+        return Action.InlineImage(
+            params = params,
+            data = imageData,
+            cursorRow = cursorRow,
+            cursorCol = cursorCol
+        )
     }
 }

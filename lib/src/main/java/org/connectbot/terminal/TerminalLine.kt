@@ -30,9 +30,7 @@ internal data class TerminalLine(
     val lastModified: Long = System.nanoTime(),
     val semanticSegments: List<SemanticSegment> = emptyList(),
     val colsAtCapture: Int = -1,
-    val continuation: Boolean = false,
-    // True if this line was produced by Kotlin reflow (synthetic), not directly from libvterm.
-    val synthetic: Boolean = false
+    val continuation: Boolean = false
 ) {
     /**
      * Get the text content of this line as a string.

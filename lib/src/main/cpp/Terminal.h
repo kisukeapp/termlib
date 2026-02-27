@@ -37,6 +37,18 @@ public:
     bool dispatchKey(int modifiers, int key);
     bool dispatchCharacter(int modifiers, int codepoint);
 
+    // Mouse input - generates mouse escape sequences
+    void mouseMove(int row, int col, int modifiers);
+    void mouseButton(int button, bool pressed, int modifiers);
+
+    // Bracketed paste
+    void startPaste();
+    void endPaste();
+
+    // Focus reporting
+    void focusIn();
+    void focusOut();
+
     // Cell data retrieval for rendering
     int getCellRun(JNIEnv* env, int row, int col, jobject runObject);
 
@@ -64,6 +76,17 @@ private:
     // libvterm state fallback for OSC sequences
     static int termOscFallback(int command, VTermStringFragment frag, void* user);
 
+    // libvterm state fallback for CSI sequences (mode 2026, mode 2048)
+    static int termCsiFallback(const char* leader, const long args[], int argcount,
+                               const char* intermed, char command, void* user);
+
+    // libvterm state fallback for DCS sequences (Sixel)
+    static int termDcsFallback(const char* command, size_t commandlen,
+                               VTermStringFragment frag, void* user);
+
+    // libvterm state fallback for APC sequences (Kitty graphics)
+    static int termApcFallback(VTermStringFragment frag, void* user);
+
     // libvterm selection callbacks for OSC 52 clipboard
     static int termSelectionSet(VTermSelectionMask mask, VTermStringFragment frag, void* user);
     static int termSelectionQuery(VTermSelectionMask mask, void* user);
@@ -78,10 +101,16 @@ private:
     int invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *continuation);
     void invokeKeyboardOutput(const char* data, size_t len);
     int invokeOscSequence(int command, const std::string& payload, int cursorRow, int cursorCol);
+    void invokeSyncOutputChanged(bool active);
+    void invokeKittyKeyboardChanged(bool push, int flags);
+    void invokeDcsSequence(const std::string& command, const std::string& data,
+                           int cursorRow, int cursorCol);
+    void invokeApcSequence(const std::string& data, int cursorRow, int cursorCol);
 
     // Helper functions
     static bool cellStyleEqual(const VTermScreenCell& a, const VTermScreenCell& b);
     void resolveColor(const VTermColor& color, uint8_t& r, uint8_t& g, uint8_t& b);
+    VTermModifier buildModifier(int modifiers);
 
     // libvterm state
     VTerm* mVt;
@@ -100,6 +129,15 @@ private:
     int mOscCommand{-1};   // Current OSC command being accumulated
     VTermPos mOscCursorPos{0, 0};  // Cursor position when OSC sequence started
 
+    // DCS fallback buffer for accumulating fragmented DCS sequences (Sixel)
+    std::string mDcsCommand;
+    std::string mDcsData;
+    VTermPos mDcsCursorPos{0, 0};
+
+    // APC fallback buffer for accumulating fragmented APC sequences (Kitty graphics)
+    std::string mApcData;
+    VTermPos mApcCursorPos{0, 0};
+
     // Terminal dimensions
     int mRows;
     int mCols;
@@ -116,6 +154,10 @@ private:
     jmethodID mPopScrollbackMethod;
     jmethodID mKeyboardInputMethod;
     jmethodID mOscSequenceMethod;
+    jmethodID mSyncOutputChangedMethod;
+    jmethodID mKittyKeyboardChangedMethod;
+    jmethodID mDcsSequenceMethod;
+    jmethodID mApcSequenceMethod;
 
     // Cached Java class and field IDs for CellRun
     jclass mCellRunClass;

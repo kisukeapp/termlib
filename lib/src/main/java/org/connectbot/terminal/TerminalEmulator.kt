@@ -20,7 +20,6 @@ import android.icu.lang.UCharacter
 import android.icu.lang.UProperty
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import androidx.annotation.VisibleForTesting
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -105,7 +104,55 @@ sealed interface TerminalEmulator {
         defaultBackground: Int
     )
 
+    /**
+     * Dispatch mouse move event to the terminal.
+     * Only sends to libvterm when mouse mode is active.
+     */
+    fun mouseMove(row: Int, col: Int, modifiers: Int)
+
+    /**
+     * Dispatch mouse button event to the terminal.
+     * Only sends to libvterm when mouse mode is active.
+     */
+    fun mouseButton(button: Int, pressed: Boolean, modifiers: Int)
+
+    /**
+     * Paste text with bracketed paste support.
+     * Wraps text in bracketed paste sequences when mode 2004 is active.
+     */
+    fun paste(text: String)
+
+    /**
+     * Notify terminal of focus gain.
+     */
+    fun focusIn()
+
+    /**
+     * Notify terminal of focus loss.
+     */
+    fun focusOut()
+
+    /**
+     * Current mouse mode (NONE, CLICK, DRAG, MOVE).
+     */
+    val mouseMode: MouseMode
+
+    /**
+     * Whether kitty keyboard protocol is active.
+     */
+    val kittyKeyboardActive: Boolean
+
     val dimensions: TerminalDimensions
+}
+
+/**
+ * Mouse tracking modes matching libvterm VTERM_PROP_MOUSE values.
+ */
+enum class MouseMode {
+    NONE,
+    CLICK,
+    DRAG,
+    MOVE
 }
 
 class TerminalEmulatorFactory {
@@ -125,6 +172,9 @@ class TerminalEmulatorFactory {
          *                        The callback receives the decoded text to copy.
          * @param onProgressChange Optional callback for OSC 9;4 progress reporting.
          *                         The callback receives the progress state and percentage (0-100).
+         * @param onCommandLineChanged Optional callback for command line changes detected via
+         *                             native screen readback (OSC 133 shell integration).
+         *                             Receives the command text and cursor offset within it.
          */
         fun create(
             looper: Looper = Looper.getMainLooper(),
@@ -136,7 +186,8 @@ class TerminalEmulatorFactory {
             onBell: (() -> Unit)? = null,
             onResize: ((TerminalDimensions) -> Unit)? = null,
             onClipboardCopy: ((String) -> Unit)? = null,
-            onProgressChange: ((ProgressState, Int) -> Unit)? = null
+            onProgressChange: ((ProgressState, Int) -> Unit)? = null,
+            onCommandLineChanged: ((String, Int) -> Unit)? = null
         ): TerminalEmulator {
             return TerminalEmulatorImpl(
                 looper = looper,
@@ -148,7 +199,8 @@ class TerminalEmulatorFactory {
                 onBell = onBell,
                 onResize = onResize,
                 onClipboardCopy = onClipboardCopy,
-                onProgressChange = onProgressChange
+                onProgressChange = onProgressChange,
+                onCommandLineChanged = onCommandLineChanged
             )
         }
     }
@@ -194,12 +246,9 @@ internal class TerminalEmulatorImpl(
     private val onBell: (() -> Unit)? = null,
     private val onResize: ((TerminalDimensions) -> Unit)? = null,
     private val onClipboardCopy: ((String) -> Unit)? = null,
-    private val onProgressChange: ((ProgressState, Int) -> Unit)? = null
+    private val onProgressChange: ((ProgressState, Int) -> Unit)? = null,
+    private val onCommandLineChanged: ((String, Int) -> Unit)? = null
 ) : TerminalEmulator, TerminalCallbacks {
-
-    companion object {
-        private const val REFLOW_LOG_TAG = "TERMLIB_REFLOW"
-    }
 
     // Handler for escaping native mutex
     private val handler = Handler(looper)
@@ -227,6 +276,10 @@ internal class TerminalEmulatorImpl(
     // Sequence number for ordering snapshots
     private var sequenceNumber = 0L
 
+    // Command line change tracking for callback deduplication
+    private var lastCommandLineText: String? = null
+    private var lastCommandLineCursor: Int = -1
+
     // Terminal dimensions
     override val dimensions: TerminalDimensions
         get() = TerminalDimensions(rows = rows, columns = cols)
@@ -243,6 +296,20 @@ internal class TerminalEmulatorImpl(
 
     // Terminal properties
     private var terminalTitle = ""
+
+    // Mouse mode tracking (set via setTermProp with VTERM_PROP_MOUSE)
+    private var _mouseMode = MouseMode.NONE
+    override val mouseMode: MouseMode get() = _mouseMode
+
+    // Synchronized output mode (CSI ? 2026 h/l)
+    private var syncOutputActive = false
+    private val syncOutputHandler = Handler(looper)
+    private val syncOutputTimeout = Runnable { flushSyncOutput() }
+    private val SYNC_OUTPUT_TIMEOUT_MS = 1000L
+
+    // Kitty keyboard protocol
+    private val kittyKeyboardStack = mutableListOf<Int>()
+    override val kittyKeyboardActive: Boolean get() = kittyKeyboardStack.isNotEmpty()
 
     // Scrollback buffer
     private val scrollback = mutableListOf<TerminalLine>()
@@ -267,7 +334,7 @@ internal class TerminalEmulatorImpl(
     // Scrollback snapshot used during resize; mutated by pop callbacks.
     // Guarded by damageLock.
     private var resizeScrollback: MutableList<TerminalLine> = mutableListOf()
-    private var resizePushCount: Int = 0
+    private var resizePushedLines: MutableList<TerminalLine> = mutableListOf()
 
     // Serializes all access to libvterm via terminalNative.
     // libvterm is NOT thread-safe: writeInput() (transport thread) and resize() (main
@@ -284,6 +351,21 @@ internal class TerminalEmulatorImpl(
 
     // Parser for OSC sequences
     private val oscParser = OscParser()
+
+    // Image manager for inline images (iTerm2 OSC 1337, Sixel, Kitty graphics)
+    private val imageManager = ImageManager()
+
+    // Sixel decoder for DCS 'q' sequences
+    private val sixelDecoder = SixelDecoder()
+
+    // Search engine
+    private val searchEngine = SearchEngine()
+
+    // Implicit link detector
+    private val linkDetector = ImplicitLinkDetector()
+
+    // Kitty graphics handler
+    private val kittyGraphics = KittyGraphics(imageManager)
 
     // ================================================================================
     // Public API
@@ -319,11 +401,6 @@ internal class TerminalEmulatorImpl(
         val preResizeScreenLines: List<TerminalLine>
         val currentDefaultFg: Color
         val currentDefaultBg: Color
-        // Snapshot state and prepare for resize under damageLock.
-        val shouldLog = shouldLogReflow()
-        val preLogData: ReflowLogData?
-        var gapScanScrollback: List<TerminalLine>? = null
-        var gapScanScreen: List<TerminalLine>? = null
         val preReflowedScrollback: List<TerminalLine>
         synchronized(damageLock) {
             resizing = true
@@ -332,40 +409,25 @@ internal class TerminalEmulatorImpl(
             currentDefaultBg = currentDefaultBackground
             preResizeScrollback = scrollback.toList()
             preResizeScreenLines = currentLines.toList()
-            resizePushCount = 0
+            resizePushedLines.clear()
             pendingDamageRegions.clear()
             damagePosted = false
-            preLogData = if (shouldLog) {
-                buildReflowLogData(
-                    stage = "pre",
-                    rows = rows,
-                    cols = cols,
-                    scrollback = preResizeScrollback,
-                    screen = preResizeScreenLines,
-                    defaultFg = currentDefaultFg,
-                    defaultBg = currentDefaultBg
-                )
-            } else {
-                null
-            }
         }
 
-        preReflowedScrollback = if (colsChanged) {
-            if (preResizeScrollback.isNotEmpty()) {
-                reflowLines(
-                    lines = stripOldWidthPadding(
-                        preResizeScrollback,
-                        oldCols,
-                        currentDefaultFg,
-                        currentDefaultBg
-                    ),
-                    newCols = newCols,
-                    defaultFg = currentDefaultFg,
-                    defaultBg = currentDefaultBg
-                )
-            } else {
-                preResizeScrollback
-            }
+        // Pre-reflow scrollback to new column width. This serves as the pop buffer
+        // during native resize — libvterm requests popped lines at new_cols.
+        preReflowedScrollback = if (colsChanged && preResizeScrollback.isNotEmpty()) {
+            reflowLines(
+                lines = stripOldWidthPadding(
+                    preResizeScrollback,
+                    oldCols,
+                    currentDefaultFg,
+                    currentDefaultBg
+                ),
+                newCols = newCols,
+                defaultFg = currentDefaultFg,
+                defaultBg = currentDefaultBg
+            )
         } else {
             preResizeScrollback
         }
@@ -373,10 +435,6 @@ internal class TerminalEmulatorImpl(
         synchronized(damageLock) {
             resizeScrollback.clear()
             resizeScrollback.addAll(preReflowedScrollback)
-        }
-
-        if (preLogData != null) {
-            logReflowData(preLogData)
         }
 
         rows = newRows
@@ -395,47 +453,34 @@ internal class TerminalEmulatorImpl(
                 readLineFromLibvterm(row, preserveTrailingSpaces = false)
             }
 
-            val postLogData: ReflowLogData?
             synchronized(damageLock) {
-                // Reflow scrollback: remaining pre-resize scrollback + lines pushed by
-                // libvterm during resize (at old column width).
-                val pushCount = resizePushCount.coerceAtMost(preResizeScreenLines.size)
-                val pushedFromScreen = if (pushCount > 0) {
-                    preResizeScreenLines.take(pushCount)
+                // Assemble scrollback from the push/pop protocol:
+                // - resizeScrollback = pop buffer remainder (what wasn't popped)
+                // - resizePushedLines = actual data from push callbacks (at old width)
+                val pushedLines = resizePushedLines.toList()
+
+                val newScrollback = if (pushedLines.isEmpty()) {
+                    // No pushes — scrollback is just what wasn't popped
+                    resizeScrollback.toList()
+                } else if (colsChanged) {
+                    // Reflow pop buffer remainder + pushed lines TOGETHER.
+                    // This preserves logical lines that span the boundary
+                    // (pushed lines with continuation=true join with scrollback).
+                    reflowLines(
+                        lines = resizeScrollback + pushedLines,
+                        newCols = newCols,
+                        defaultFg = currentDefaultFg,
+                        defaultBg = currentDefaultBg
+                    )
                 } else {
-                    emptyList()
-                }
-                val newScrollback = if (colsChanged) {
-                    val reflowedPushed = if (pushedFromScreen.isNotEmpty()) {
-                        reflowLines(
-                            lines = stripOldWidthPadding(
-                                pushedFromScreen,
-                                oldCols,
-                                currentDefaultFg,
-                                currentDefaultBg
-                            ),
-                            newCols = newCols,
-                            defaultFg = currentDefaultFg,
-                            defaultBg = currentDefaultBg
-                        )
-                    } else {
-                        pushedFromScreen
-                    }
-                    resizeScrollback + reflowedPushed
-                } else {
-                    resizeScrollback + pushedFromScreen
+                    // No column change — just concatenate
+                    resizeScrollback + pushedLines
                 }
 
-                val alignedScrollback = if (colsChanged) {
-                    alignScrollbackToScreen(newScrollback, screenLines) ?: newScrollback
+                val boundedScrollback = if (newScrollback.size > maxScrollbackLines) {
+                    newScrollback.takeLast(maxScrollbackLines)
                 } else {
                     newScrollback
-                }
-
-                val boundedScrollback = if (alignedScrollback.size > maxScrollbackLines) {
-                    alignedScrollback.takeLast(maxScrollbackLines)
-                } else {
-                    alignedScrollback
                 }
 
                 // When only rows change, libvterm can reset continuation flags on the
@@ -456,12 +501,6 @@ internal class TerminalEmulatorImpl(
                     }
                 }
 
-                if (colsChanged) {
-                    // Leave screen lines as libvterm produced them.
-                }
-
-                // For column changes, keep screen lines as libvterm produced them.
-
                 scrollback.clear()
                 scrollback.addAll(boundedScrollback)
                 scrollbackDirty = true
@@ -469,57 +508,12 @@ internal class TerminalEmulatorImpl(
                 currentLines = screenLines
 
                 resizeScrollback.clear()
-                resizePushCount = 0
+                resizePushedLines.clear()
                 pendingDamageRegions.clear()
                 damagePosted = false
 
                 resizing = false
                 resizeAllowPop = true
-
-                postLogData = if (shouldLog) {
-                    buildReflowLogData(
-                        stage = "post",
-                        rows = rows,
-                        cols = cols,
-                        scrollback = scrollback,
-                        screen = currentLines,
-                        defaultFg = currentDefaultFg,
-                        defaultBg = currentDefaultBg
-                    )
-                } else {
-                    null
-                }
-
-                if (shouldLog) {
-                    gapScanScrollback = scrollback.toList()
-                    gapScanScreen = currentLines.toList()
-                }
-            }
-
-            if (postLogData != null) {
-                logReflowData(postLogData)
-            }
-
-            if (gapScanScrollback != null && gapScanScreen != null) {
-                logContinuationGaps(
-                    scrollback = gapScanScrollback ?: emptyList(),
-                    screen = gapScanScreen ?: emptyList(),
-                    defaultFg = currentDefaultFg,
-                    defaultBg = currentDefaultBg,
-                    tagSuffix = "full"
-                )
-                logInternalBlankRuns(
-                    lines = gapScanScrollback ?: emptyList(),
-                    label = "sb",
-                    defaultFg = currentDefaultFg,
-                    defaultBg = currentDefaultBg
-                )
-                logInternalBlankRuns(
-                    lines = gapScanScreen ?: emptyList(),
-                    label = "sc",
-                    defaultFg = currentDefaultFg,
-                    defaultBg = currentDefaultBg
-                )
             }
 
             // Sync any corrected continuation flags back to libvterm.
@@ -554,6 +548,43 @@ internal class TerminalEmulatorImpl(
     override fun dispatchCharacter(modifiers: Int, character: Char) {
         synchronized(nativeLock) {
             terminalNative.dispatchCharacter(modifiers, character.code)
+        }
+    }
+
+    override fun mouseMove(row: Int, col: Int, modifiers: Int) {
+        if (_mouseMode == MouseMode.NONE) return
+        synchronized(nativeLock) {
+            terminalNative.mouseMove(row, col, modifiers)
+        }
+    }
+
+    override fun mouseButton(button: Int, pressed: Boolean, modifiers: Int) {
+        if (_mouseMode == MouseMode.NONE) return
+        synchronized(nativeLock) {
+            terminalNative.mouseButton(button, pressed, modifiers)
+        }
+    }
+
+    override fun paste(text: String) {
+        if (text.isEmpty()) return
+        synchronized(nativeLock) {
+            terminalNative.startPaste()
+            for (char in text) {
+                terminalNative.dispatchCharacter(0, char.code)
+            }
+            terminalNative.endPaste()
+        }
+    }
+
+    override fun focusIn() {
+        synchronized(nativeLock) {
+            terminalNative.focusIn()
+        }
+    }
+
+    override fun focusOut() {
+        synchronized(nativeLock) {
+            terminalNative.focusOut()
         }
     }
 
@@ -637,7 +668,8 @@ internal class TerminalEmulatorImpl(
     override fun damage(startRow: Int, endRow: Int, startCol: Int, endCol: Int): Int {
         synchronized(damageLock) {
             addDamageRegion(startRow, endRow, startCol, endCol)
-            if (!damagePosted) {
+            // When synchronized output is active, accumulate damage but don't post
+            if (!syncOutputActive && !damagePosted) {
                 handler.post { processPendingUpdates() }
                 damagePosted = true
             }
@@ -688,15 +720,28 @@ internal class TerminalEmulatorImpl(
                     }
                 }
                 is TerminalProperty.IntValue -> {
-                    // Property 6 is VTERM_PROP_CURSORSHAPE (from vterm.h line 260)
-                    if (prop == 6) {
-                        cursorShape = when (value.value) {
-                            1 -> CursorShape.BLOCK       // VTERM_PROP_CURSORSHAPE_BLOCK
-                            2 -> CursorShape.UNDERLINE   // VTERM_PROP_CURSORSHAPE_UNDERLINE
-                            3 -> CursorShape.BAR_LEFT    // VTERM_PROP_CURSORSHAPE_BAR_LEFT
-                            else -> CursorShape.BLOCK
+                    when (prop) {
+                        // Property 6 is VTERM_PROP_CURSORSHAPE (from vterm.h line 260)
+                        6 -> {
+                            cursorShape = when (value.value) {
+                                1 -> CursorShape.BLOCK
+                                2 -> CursorShape.UNDERLINE
+                                3 -> CursorShape.BAR_LEFT
+                                else -> CursorShape.BLOCK
+                            }
+                            propertyChanged = true
                         }
-                        propertyChanged = true
+                        // Property 8 is VTERM_PROP_MOUSE (from vterm.h line 261)
+                        8 -> {
+                            _mouseMode = when (value.value) {
+                                0 -> MouseMode.NONE
+                                1 -> MouseMode.CLICK
+                                2 -> MouseMode.DRAG
+                                3 -> MouseMode.MOVE
+                                else -> MouseMode.NONE
+                            }
+                            propertyChanged = true
+                        }
                     }
                 }
                 else -> {
@@ -728,7 +773,7 @@ internal class TerminalEmulatorImpl(
             // During resize: capture pushed lines for later scrollback reflow.
             // libvterm pushes lines at OLD column width during its own reflow.
             if (resizing) {
-                resizePushCount++
+                resizePushedLines.add(line)
                 return 0
             }
 
@@ -900,16 +945,170 @@ internal class TerminalEmulatorImpl(
                             onProgressChange?.invoke(action.state, action.progress)
                         }
                     }
+                    is OscParser.Action.QueryColor -> {
+                        // Respond with current color in rgb:RRRR/GGGG/BBBB format
+                        val color = when (action.colorType) {
+                            OscParser.DynamicColorType.FOREGROUND -> currentDefaultForeground
+                            OscParser.DynamicColorType.BACKGROUND -> currentDefaultBackground
+                            OscParser.DynamicColorType.CURSOR -> currentDefaultForeground
+                        }
+                        val oscNum = when (action.colorType) {
+                            OscParser.DynamicColorType.FOREGROUND -> 10
+                            OscParser.DynamicColorType.BACKGROUND -> 11
+                            OscParser.DynamicColorType.CURSOR -> 12
+                        }
+                        val argb = color.toArgb()
+                        val r = (argb shr 16) and 0xFF
+                        val g = (argb shr 8) and 0xFF
+                        val b = argb and 0xFF
+                        val response = "\u001B]$oscNum;rgb:${"%04x".format(r * 257)}/${"%04x".format(g * 257)}/${"%04x".format(b * 257)}\u001B\\"
+                        handler.post {
+                            onKeyboardInput.invoke(response.toByteArray())
+                        }
+                    }
+                    is OscParser.Action.SetDynamicColor -> {
+                        when (action.colorType) {
+                            OscParser.DynamicColorType.FOREGROUND -> {
+                                currentDefaultForeground = Color(action.red, action.green, action.blue)
+                            }
+                            OscParser.DynamicColorType.BACKGROUND -> {
+                                currentDefaultBackground = Color(action.red, action.green, action.blue)
+                            }
+                            OscParser.DynamicColorType.CURSOR -> {
+                                // Cursor color - store but no dedicated field yet
+                            }
+                        }
+                        propertyChanged = true
+                        if (!damagePosted) {
+                            handler.post { processPendingUpdates() }
+                            damagePosted = true
+                        }
+                    }
+                    is OscParser.Action.InlineImage -> {
+                        // Decode and place image via ImageManager
+                        handler.post {
+                            handleInlineImage(action)
+                        }
+                    }
                 }
             }
         }
         return 1
     }
 
+    override fun onSyncOutputChanged(active: Boolean) {
+        synchronized(damageLock) {
+            if (active) {
+                syncOutputActive = true
+                syncOutputHandler.postDelayed(syncOutputTimeout, SYNC_OUTPUT_TIMEOUT_MS)
+            } else {
+                syncOutputActive = false
+                syncOutputHandler.removeCallbacks(syncOutputTimeout)
+                // Flush any accumulated damage
+                if (pendingDamageRegions.isNotEmpty() || cursorMoved || propertyChanged) {
+                    if (!damagePosted) {
+                        handler.post { processPendingUpdates() }
+                        damagePosted = true
+                    }
+                }
+            }
+        }
+    }
+
+    private fun flushSyncOutput() {
+        synchronized(damageLock) {
+            syncOutputActive = false
+            if (pendingDamageRegions.isNotEmpty() || cursorMoved || propertyChanged) {
+                if (!damagePosted) {
+                    handler.post { processPendingUpdates() }
+                    damagePosted = true
+                }
+            }
+        }
+    }
+
+    override fun onKittyKeyboardChanged(push: Boolean, flags: Int) {
+        synchronized(damageLock) {
+            if (push) {
+                kittyKeyboardStack.add(flags)
+            } else {
+                if (kittyKeyboardStack.isNotEmpty()) {
+                    kittyKeyboardStack.removeAt(kittyKeyboardStack.size - 1)
+                }
+            }
+        }
+    }
+
+    override fun onDcsSequence(command: String, data: String, cursorRow: Int, cursorCol: Int) {
+        // DCS 'q' is Sixel graphics
+        if (command == "q" || command.endsWith("q")) {
+            handler.post {
+                val bitmap = sixelDecoder.decode(data) ?: return@post
+                val charHeight = 16 // Approximate; actual value from renderer
+                val charWidth = 8
+                val widthCells = (bitmap.width + charWidth - 1) / charWidth
+                val heightCells = (bitmap.height + charHeight - 1) / charHeight
+                imageManager.placeImage(bitmap, cursorRow, cursorCol, widthCells, heightCells)
+                synchronized(damageLock) {
+                    propertyChanged = true
+                    if (!damagePosted) {
+                        handler.post { processPendingUpdates() }
+                        damagePosted = true
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onApcSequence(data: String, cursorRow: Int, cursorCol: Int) {
+        // APC '_G' prefix is Kitty graphics protocol
+        if (data.startsWith("G")) {
+            handler.post {
+                val response = kittyGraphics.handleSequence(data.substring(1), cursorRow, cursorCol)
+                if (response != null) {
+                    // Send response back via PTY
+                    val responseBytes = "\u001B_${response.message}\u001B\\".toByteArray()
+                    onKeyboardInput.invoke(responseBytes)
+                }
+                synchronized(damageLock) {
+                    propertyChanged = true
+                    if (!damagePosted) {
+                        handler.post { processPendingUpdates() }
+                        damagePosted = true
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * Apply a semantic segment immediately to the current line.
      * Segments are applied immediately so they can be properly shifted during scroll.
      */
+    private fun handleInlineImage(action: OscParser.Action.InlineImage) {
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(action.data, 0, action.data.size)
+            ?: return
+
+        // Parse width/height from params (in cells)
+        val requestedWidth = action.params["width"]?.toIntOrNull()
+        val requestedHeight = action.params["height"]?.toIntOrNull()
+        val charWidth = 8  // Approximate
+        val charHeight = 16 // Approximate
+
+        val widthCells = requestedWidth ?: ((bitmap.width + charWidth - 1) / charWidth)
+        val heightCells = requestedHeight ?: ((bitmap.height + charHeight - 1) / charHeight)
+
+        imageManager.placeImage(bitmap, action.cursorRow, action.cursorCol, widthCells, heightCells)
+
+        synchronized(damageLock) {
+            propertyChanged = true
+            if (!damagePosted) {
+                handler.post { processPendingUpdates() }
+                damagePosted = true
+            }
+        }
+    }
+
     private fun addSemanticSegment(
         row: Int,
         startCol: Int,
@@ -1002,6 +1201,20 @@ internal class TerminalEmulatorImpl(
         // Build and emit new snapshot
         val newSnapshot = buildSnapshot()
         _snapshot.value = newSnapshot
+
+        // Emit command line change if different from last reported
+        val cmdInfo = newSnapshot.commandLineInfo
+        if (cmdInfo != null) {
+            if (cmdInfo.text != lastCommandLineText || cmdInfo.cursorOffset != lastCommandLineCursor) {
+                lastCommandLineText = cmdInfo.text
+                lastCommandLineCursor = cmdInfo.cursorOffset
+                onCommandLineChanged?.invoke(cmdInfo.text, cmdInfo.cursorOffset)
+            }
+        } else if (lastCommandLineText != null) {
+            lastCommandLineText = null
+            lastCommandLineCursor = -1
+            onCommandLineChanged?.invoke("", 0)
+        }
     }
 
     /**
@@ -1313,6 +1526,37 @@ internal class TerminalEmulatorImpl(
     }
 
     /**
+     * Add HYPERLINK semantic segments for any URLs detected by ImplicitLinkDetector
+     * that are not already covered by an explicit OSC 8 hyperlink segment.
+     */
+    private fun enrichWithImplicitLinks(line: TerminalLine): TerminalLine {
+        val implicitLinks = linkDetector.detectLinks(line)
+        if (implicitLinks.isEmpty()) return line
+
+        val extra = implicitLinks.mapNotNull { link ->
+            // Skip if an OSC 8 segment already covers this range
+            val alreadyCovered = line.semanticSegments.any {
+                it.semanticType == SemanticType.HYPERLINK &&
+                    it.startCol <= link.startCol && it.endCol >= link.endCol
+            }
+            if (alreadyCovered) return@mapNotNull null
+
+            SemanticSegment(
+                startCol = link.startCol,
+                endCol = link.endCol + 1, // endCol is exclusive in SemanticSegment
+                semanticType = SemanticType.HYPERLINK,
+                metadata = link.url,
+                promptId = -1
+            )
+        }
+        if (extra.isEmpty()) return line
+
+        return line.copy(
+            semanticSegments = (line.semanticSegments + extra).sortedBy { it.startCol }
+        )
+    }
+
+    /**
      * Build a complete snapshot of terminal state.
      */
     private fun buildSnapshot(): TerminalSnapshot {
@@ -1324,8 +1568,12 @@ internal class TerminalEmulatorImpl(
             }
         }
 
+        // Enrich lines with implicit link segments so the renderer can
+        // underline detected URLs (http/https/…) that weren't wrapped in OSC 8.
+        val enrichedLines = currentLines.map { line -> enrichWithImplicitLinks(line) }
+
         return TerminalSnapshot(
-            lines = currentLines.toList(),  // Immutable copy (24 references)
+            lines = enrichedLines,
             scrollback = scrollbackSnapshot,  // Reuse cached immutable copy
             cursorRow = cursorRow,
             cursorCol = cursorCol,
@@ -1336,7 +1584,50 @@ internal class TerminalEmulatorImpl(
             rows = rows,
             cols = cols,
             timestamp = System.currentTimeMillis(),
-            sequenceNumber = sequenceNumber++
+            sequenceNumber = sequenceNumber++,
+            mouseMode = _mouseMode,
+            imagePlacements = imageManager.getPlacements(),
+            commandLineInfo = extractCommandLineInfo()
+        )
+    }
+
+    /**
+     * Extract the current command line text by reading terminal buffer cells
+     * between the OSC 133 prompt end column and the cursor position.
+     */
+    private fun extractCommandLineInfo(): CommandLineInfo? {
+        val row = cursorRow
+        if (row < 0 || row >= currentLines.size) return null
+
+        val line = currentLines[row]
+        val promptSegment = line.getSegmentsOfType(SemanticType.PROMPT).lastOrNull()
+            ?: return null
+
+        val inputStartCol = promptSegment.endCol
+        if (inputStartCol < 0 || inputStartCol > cols) return null
+
+        // Read cell text from inputStartCol up to cursorCol only.
+        // Text after the cursor may include shell autosuggestions (e.g. zsh-autosuggestions)
+        // which are NOT part of the actual command buffer and must be excluded.
+        val endCol = cursorCol.coerceAtMost(line.cells.size)
+        val fullText = buildString {
+            for (i in inputStartCol until endCol) {
+                val cell = line.cells[i]
+                if (cell.char == '\u0000') {
+                    append(' ')
+                } else {
+                    append(cell.char)
+                    cell.combiningChars.forEach { append(it) }
+                }
+            }
+        }.trimEnd()
+
+        val cursorOffset = fullText.length
+
+        return CommandLineInfo(
+            text = fullText,
+            cursorOffset = cursorOffset,
+            promptId = promptSegment.promptId
         )
     }
 
@@ -1473,77 +1764,6 @@ internal class TerminalEmulatorImpl(
         return result
     }
 
-    private fun alignScrollbackToScreen(
-        reflowedAll: List<TerminalLine>,
-        screenLines: List<TerminalLine>
-    ): List<TerminalLine>? {
-        if (screenLines.isEmpty()) return reflowedAll
-        if (reflowedAll.isEmpty()) return emptyList()
-
-        fun trimLeadingEmpty(lines: List<TerminalLine>): List<TerminalLine> {
-            var start = 0
-            while (start < lines.size) {
-                val text = lines[start].text.trimEnd()
-                if (text.isNotEmpty()) break
-                start++
-            }
-            return if (start == 0) lines else lines.subList(start, lines.size)
-        }
-
-        fun matchSuffix(
-            reflowed: List<TerminalLine>,
-            screen: List<TerminalLine>,
-            includeContinuation: Boolean
-        ): Int? {
-            if (screen.isEmpty()) return reflowed.size
-            val maxStart = reflowed.size - screen.size
-            if (maxStart < 0) return null
-
-            for (start in maxStart downTo 0) {
-                var matched = true
-                for (i in screen.indices) {
-                    val a = reflowed[start + i]
-                    val b = screen[i]
-                    val aText = a.text.trimEnd()
-                    val bText = b.text.trimEnd()
-                    if (aText != bText) {
-                        matched = false
-                        break
-                    }
-                    if (includeContinuation && a.continuation != b.continuation) {
-                        matched = false
-                        break
-                    }
-                }
-                if (matched) return start
-            }
-            return null
-        }
-
-        fun adjustSplit(start: Int, reflowed: List<TerminalLine>): Int {
-            var adjusted = start
-            while (adjusted > 0 && reflowed[adjusted].continuation) {
-                adjusted--
-            }
-            return adjusted
-        }
-
-        val trimmedScreen = trimLeadingEmpty(screenLines)
-        val exactStart = matchSuffix(reflowedAll, trimmedScreen, includeContinuation = true)
-        if (exactStart != null) {
-            val adjusted = adjustSplit(exactStart, reflowedAll)
-            return reflowedAll.subList(0, adjusted)
-        }
-
-        val looseStart = matchSuffix(reflowedAll, trimmedScreen, includeContinuation = false)
-        return if (looseStart != null) {
-            val adjusted = adjustSplit(looseStart, reflowedAll)
-            reflowedAll.subList(0, adjusted)
-        } else {
-            null
-        }
-    }
-
     private fun wrapLogicalLine(
         cells: List<TerminalLine.Cell>,
         segments: List<SemanticSegment>,
@@ -1582,8 +1802,7 @@ internal class TerminalEmulatorImpl(
                     cells = paddedCells,
                     semanticSegments = lineSegments,
                     colsAtCapture = newCols,
-                    continuation = lines.isNotEmpty(),
-                    synthetic = true
+                    continuation = lines.isNotEmpty()
                 )
             )
 
@@ -1767,346 +1986,6 @@ internal class TerminalEmulatorImpl(
             !cell.blink && !cell.reverse && !cell.strike
     }
 
-    private fun shouldLogReflow(): Boolean {
-        return Log.isLoggable(REFLOW_LOG_TAG, Log.DEBUG)
-    }
-
-    private data class ReflowLogData(
-        val stage: String,
-        val rows: Int,
-        val cols: Int,
-        val scrollbackTail: List<TerminalLine>,
-        val screenHead: List<TerminalLine>,
-        val defaultFg: Color,
-        val defaultBg: Color
-    )
-
-    private fun buildReflowLogData(
-        stage: String,
-        rows: Int,
-        cols: Int,
-        scrollback: List<TerminalLine>,
-        screen: List<TerminalLine>,
-        defaultFg: Color,
-        defaultBg: Color
-    ): ReflowLogData {
-        val tail = if (scrollback.size > 3) scrollback.takeLast(3) else scrollback
-        val head = if (screen.size > 3) screen.take(3) else screen
-        return ReflowLogData(
-            stage = stage,
-            rows = rows,
-            cols = cols,
-            scrollbackTail = tail,
-            screenHead = head,
-            defaultFg = defaultFg,
-            defaultBg = defaultBg
-        )
-    }
-
-    private fun logReflowData(data: ReflowLogData) {
-        Log.d(
-            REFLOW_LOG_TAG,
-            "reflow ${data.stage}: rows=${data.rows} cols=${data.cols} " +
-                "scrollbackTail=${data.scrollbackTail.size} screenHead=${data.screenHead.size}"
-        )
-
-        data.scrollbackTail.forEachIndexed { idx, line ->
-            Log.d(REFLOW_LOG_TAG, formatLineDebug("sb", idx, line, data.defaultFg, data.defaultBg))
-        }
-        data.screenHead.forEachIndexed { idx, line ->
-            Log.d(REFLOW_LOG_TAG, formatLineDebug("sc", idx, line, data.defaultFg, data.defaultBg))
-        }
-
-        if (data.stage == "post") {
-            logContinuationGaps(
-                scrollback = data.scrollbackTail,
-                screen = data.screenHead,
-                defaultFg = data.defaultFg,
-                defaultBg = data.defaultBg,
-                tagSuffix = "head-tail"
-            )
-        }
-    }
-
-    private fun formatLineDebug(
-        prefix: String,
-        index: Int,
-        line: TerminalLine,
-        defaultFg: Color,
-        defaultBg: Color
-    ): String {
-        val raw = buildString {
-            for (cell in line.cells) {
-                append(debugChar(cell))
-            }
-        }
-        val suspicious = hasInternalPadding(line.cells, defaultFg, defaultBg)
-        return "$prefix[$index] cont=${line.continuation} colsAt=${line.colsAtCapture} " +
-            "suspicious=$suspicious raw=$raw"
-    }
-
-    private fun debugChar(cell: TerminalLine.Cell): String {
-        return when (cell.char) {
-            '\u0000' -> "\\0"
-            ' ' -> "\\s"
-            '\t' -> "\\t"
-            '\r' -> "\\r"
-            '\n' -> "\\n"
-            else -> cell.char.toString()
-        }
-    }
-
-    private fun hasInternalPadding(
-        cells: List<TerminalLine.Cell>,
-        defaultFg: Color,
-        defaultBg: Color
-    ): Boolean {
-        var seenContent = false
-        var seenPaddingAfterContent = false
-        for (cell in cells) {
-            val isPadding = isTrimmablePaddingCell(cell, defaultFg, defaultBg)
-            if (isPadding) {
-                if (seenContent) {
-                    seenPaddingAfterContent = true
-                }
-            } else {
-                if (seenPaddingAfterContent) {
-                    return true
-                }
-                seenContent = true
-            }
-        }
-        return false
-    }
-
-    private fun logContinuationGaps(
-        scrollback: List<TerminalLine>,
-        screen: List<TerminalLine>,
-        defaultFg: Color,
-        defaultBg: Color,
-        tagSuffix: String
-    ) {
-        var logged = 0
-        val maxLogs = 6
-
-        fun logGap(tag: String, prev: TerminalLine, next: TerminalLine) {
-            if (logged >= maxLogs) return
-            val prevTrail = countTrailingBlanks(prev.cells, defaultFg, defaultBg)
-            val nextLead = countLeadingBlanks(next.cells, defaultFg, defaultBg)
-            if (prevTrail.total == 0 && nextLead.total == 0) return
-
-            Log.d(
-                REFLOW_LOG_TAG,
-                "gap $tag/$tagSuffix: " +
-                    "prevTrail=${formatBlankCounts(prevTrail)} " +
-                    "nextLead=${formatBlankCounts(nextLead)} " +
-                    "prevTail='${tailSnippet(prev.cells)}' nextHead='${headSnippet(next.cells)}'"
-            )
-            logged++
-        }
-
-        if (screen.isNotEmpty() && scrollback.isNotEmpty()) {
-            val firstScreen = screen.first()
-            val prevFromScrollback = scrollback.last()
-            if (firstScreen.continuation) {
-                logGap("boundary", prevFromScrollback, firstScreen)
-            }
-        }
-
-        for (i in 1 until scrollback.size) {
-            if (logged >= maxLogs) break
-            val line = scrollback[i]
-            if (!line.continuation) continue
-            val prev = scrollback[i - 1]
-            logGap("sb[$i]", prev, line)
-        }
-
-        for (i in 1 until screen.size) {
-            if (logged >= maxLogs) break
-            val line = screen[i]
-            if (!line.continuation) continue
-            val prev = screen[i - 1]
-            logGap("sc[$i]", prev, line)
-        }
-    }
-
-    private data class BlankCounts(
-        val total: Int,
-        val nul: Int,
-        val spaceDefault: Int,
-        val spaceStyled: Int
-    ) {
-        val space: Int = spaceDefault + spaceStyled
-    }
-
-    private fun formatBlankCounts(counts: BlankCounts): String {
-        return "${counts.total} (nul=${counts.nul}, sp=${counts.space}, " +
-            "spDef=${counts.spaceDefault}, spSty=${counts.spaceStyled})"
-    }
-
-    private fun countTrailingBlanks(
-        cells: List<TerminalLine.Cell>,
-        defaultFg: Color,
-        defaultBg: Color
-    ): BlankCounts {
-        var total = 0
-        var nul = 0
-        var spaceDefault = 0
-        var spaceStyled = 0
-        var idx = cells.size - 1
-        while (idx >= 0) {
-            val cell = cells[idx]
-            val isNul = cell.char == '\u0000'
-            val isSpace = cell.char == ' '
-            if (!isNul && !isSpace) break
-            total++
-            if (isNul) {
-                nul++
-            } else if (isDefaultStyle(cell, defaultFg, defaultBg)) {
-                spaceDefault++
-            } else {
-                spaceStyled++
-            }
-            idx--
-        }
-        return BlankCounts(total, nul, spaceDefault, spaceStyled)
-    }
-
-    private fun countLeadingBlanks(
-        cells: List<TerminalLine.Cell>,
-        defaultFg: Color,
-        defaultBg: Color
-    ): BlankCounts {
-        var total = 0
-        var nul = 0
-        var spaceDefault = 0
-        var spaceStyled = 0
-        var idx = 0
-        while (idx < cells.size) {
-            val cell = cells[idx]
-            val isNul = cell.char == '\u0000'
-            val isSpace = cell.char == ' '
-            if (!isNul && !isSpace) break
-            total++
-            if (isNul) {
-                nul++
-            } else if (isDefaultStyle(cell, defaultFg, defaultBg)) {
-                spaceDefault++
-            } else {
-                spaceStyled++
-            }
-            idx++
-        }
-        return BlankCounts(total, nul, spaceDefault, spaceStyled)
-    }
-
-    private fun tailSnippet(cells: List<TerminalLine.Cell>, max: Int = 12): String {
-        val sb = StringBuilder()
-        var count = 0
-        var idx = cells.size - 1
-        while (idx >= 0 && count < max) {
-            sb.append(debugChar(cells[idx]))
-            count++
-            idx--
-        }
-        return sb.reverse().toString()
-    }
-
-    private fun headSnippet(cells: List<TerminalLine.Cell>, max: Int = 12): String {
-        val sb = StringBuilder()
-        var count = 0
-        var idx = 0
-        while (idx < cells.size && count < max) {
-            sb.append(debugChar(cells[idx]))
-            count++
-            idx++
-        }
-        return sb.toString()
-    }
-
-    private fun logInternalBlankRuns(
-        lines: List<TerminalLine>,
-        label: String,
-        defaultFg: Color,
-        defaultBg: Color
-    ) {
-        var logged = 0
-        val maxLogs = 6
-
-        fun isBlank(cell: TerminalLine.Cell): Boolean {
-            return cell.char == '\u0000' || cell.char == ' '
-        }
-
-        for (lineIndex in lines.indices) {
-            if (logged >= maxLogs) break
-            val line = lines[lineIndex]
-            val cells = line.cells
-            var i = 0
-            while (i < cells.size) {
-                if (!isBlank(cells[i])) {
-                    i++
-                    continue
-                }
-                val runStart = i
-                var nul = 0
-                var spaceDefault = 0
-                var spaceStyled = 0
-                while (i < cells.size && isBlank(cells[i])) {
-                    val cell = cells[i]
-                    if (cell.char == '\u0000') {
-                        nul++
-                    } else if (isDefaultStyle(cell, defaultFg, defaultBg)) {
-                        spaceDefault++
-                    } else {
-                        spaceStyled++
-                    }
-                    i++
-                }
-                val runEnd = i
-                val hasLeftContent = runStart > 0
-                val hasRightContent = runEnd < cells.size
-                val hasStyledGap = spaceStyled > 0
-                val hasNulGap = nul > 0
-                if (hasLeftContent && hasRightContent && (hasStyledGap || hasNulGap)) {
-                    Log.d(
-                        REFLOW_LOG_TAG,
-                        "internal-gap $label[$lineIndex]: " +
-                            "runLen=${runEnd - runStart} nul=$nul " +
-                            "spDef=$spaceDefault spSty=$spaceStyled " +
-                            "cont=${line.continuation} colsAt=${line.colsAtCapture} " +
-                            "ctx='${gapSnippet(cells, runStart, runEnd)}'"
-                    )
-                    logged++
-                    if (logged >= maxLogs) break
-                }
-            }
-        }
-    }
-
-    private fun gapSnippet(
-        cells: List<TerminalLine.Cell>,
-        start: Int,
-        end: Int,
-        context: Int = 6
-    ): String {
-        val prefixStart = (start - context).coerceAtLeast(0)
-        val suffixEnd = (end + context).coerceAtMost(cells.size)
-        val sb = StringBuilder()
-        for (i in prefixStart until start) {
-            sb.append(debugChar(cells[i]))
-        }
-        sb.append('[')
-        for (i in start until end) {
-            sb.append(debugChar(cells[i]))
-        }
-        sb.append(']')
-        for (i in end until suffixEnd) {
-            sb.append(debugChar(cells[i]))
-        }
-        return sb.toString()
-    }
-
-
     private fun cellsWidth(cells: List<TerminalLine.Cell>): Int {
         var width = 0
         for (cell in cells) {
@@ -2211,8 +2090,7 @@ internal class TerminalEmulatorImpl(
             row = -1,
             cells = List(newCols) { blankCell(defaultFg, defaultBg) },
             semanticSegments = emptyList(),
-            colsAtCapture = newCols,
-            synthetic = true
+            colsAtCapture = newCols
         )
     }
 

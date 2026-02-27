@@ -138,6 +138,36 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
         nativeSetLineContinuation(nativePtr, row, continuation)
     }
 
+    fun mouseMove(row: Int, col: Int, modifiers: Int) {
+        checkNotClosed()
+        nativeMouseMove(nativePtr, row, col, modifiers)
+    }
+
+    fun mouseButton(button: Int, pressed: Boolean, modifiers: Int) {
+        checkNotClosed()
+        nativeMouseButton(nativePtr, button, pressed, modifiers)
+    }
+
+    fun startPaste() {
+        checkNotClosed()
+        nativeStartPaste(nativePtr)
+    }
+
+    fun endPaste() {
+        checkNotClosed()
+        nativeEndPaste(nativePtr)
+    }
+
+    fun focusIn() {
+        checkNotClosed()
+        nativeFocusIn(nativePtr)
+    }
+
+    fun focusOut() {
+        checkNotClosed()
+        nativeFocusOut(nativePtr)
+    }
+
     /**
      * Set ANSI palette colors (indices 0-15).
      *
@@ -206,6 +236,12 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     private external fun nativeSetLineContinuation(ptr: Long, row: Int, continuation: Boolean)
     private external fun nativeSetPaletteColors(ptr: Long, colors: IntArray, count: Int): Int
     private external fun nativeSetDefaultColors(ptr: Long, fgColor: Int, bgColor: Int): Int
+    private external fun nativeMouseMove(ptr: Long, row: Int, col: Int, modifiers: Int)
+    private external fun nativeMouseButton(ptr: Long, button: Int, pressed: Boolean, modifiers: Int)
+    private external fun nativeStartPaste(ptr: Long)
+    private external fun nativeEndPaste(ptr: Long)
+    private external fun nativeFocusIn(ptr: Long)
+    private external fun nativeFocusOut(ptr: Long)
 
     companion object {
         init {

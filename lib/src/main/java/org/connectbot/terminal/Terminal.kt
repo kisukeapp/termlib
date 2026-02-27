@@ -54,6 +54,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -280,6 +281,9 @@ private const val SCROLL_EPSILON_PX = 0.5f
  *                        When false, no keyboard input (hardware or soft) is accepted.
  * @param showSoftKeyboard Whether to show the soft keyboard/IME (default: true when keyboardEnabled=true).
  *                         Only applies when keyboardEnabled=true. Hardware keyboard always works when keyboardEnabled=true.
+ * @param pinchZoomEnabled Whether the Terminal composable handles pinch-to-zoom internally (default: true).
+ *                         Set to false when the host view handles zoom externally (e.g. via ScaleGestureDetector)
+ *                         to eliminate the per-tap multi-touch detection delay.
  * @param focusRequester Focus requester for keyboard input (if enabled)
  * @param onTerminalTap Callback for a simple tap event on the terminal (when no selection is active)
  * @param onImeVisibilityChanged Callback invoked when IME visibility changes (true = shown, false = hidden)
@@ -299,6 +303,7 @@ fun Terminal(
     foregroundColor: Color = Color.White,
     keyboardEnabled: Boolean = false,
     showSoftKeyboard: Boolean = true,
+    pinchZoomEnabled: Boolean = true,
     focusRequester: FocusRequester = remember { FocusRequester() },
     onTerminalTap: () -> Unit = {},
     onImeVisibilityChanged: (Boolean) -> Unit = {},
@@ -318,6 +323,7 @@ fun Terminal(
         foregroundColor = foregroundColor,
         keyboardEnabled = keyboardEnabled,
         showSoftKeyboard = showSoftKeyboard,
+        pinchZoomEnabled = pinchZoomEnabled,
         focusRequester = focusRequester,
         onTerminalTap = onTerminalTap,
         onImeVisibilityChanged = onImeVisibilityChanged,
@@ -346,6 +352,7 @@ fun TerminalWithAccessibility(
     foregroundColor: Color = Color.White,
     keyboardEnabled: Boolean = false,
     showSoftKeyboard: Boolean = true,
+    pinchZoomEnabled: Boolean = true,
     focusRequester: FocusRequester = remember { FocusRequester() },
     onTerminalTap: () -> Unit = {},
     onImeVisibilityChanged: (Boolean) -> Unit = {},
@@ -656,6 +663,13 @@ fun TerminalWithAccessibility(
                 if (keyboardEnabled) {
                     Modifier
                         .focusable()
+                        .onFocusChanged { focusState ->
+                            if (focusState.isFocused) {
+                                terminalEmulator.focusIn()
+                            } else {
+                                terminalEmulator.focusOut()
+                            }
+                        }
                         .onPreviewKeyEvent { event ->
                             // In Review Mode, let accessibility system handle navigation keys
                             if (isReviewMode) {
@@ -830,11 +844,17 @@ fun TerminalWithAccessibility(
                             }
                         }
 
-                        // 2. Check for multi-touch (zoom)
-                        val secondPointer = withTimeoutOrNull(
-                            WAIT_FOR_SECOND_TOUCH_MS
-                        ) {
-                            awaitPointerEvent().changes.firstOrNull { it.id != down.id && it.pressed }
+                        // 2. Check for multi-touch (zoom) — only when pinch zoom is
+                        //    handled internally.  When the host view handles zoom
+                        //    externally (pinchZoomEnabled = false) the second pointer
+                        //    never reaches us anyway, so skip the 40 ms wait to keep
+                        //    single-tap response instant.
+                        val secondPointer = if (pinchZoomEnabled) {
+                            withTimeoutOrNull(WAIT_FOR_SECOND_TOUCH_MS) {
+                                awaitPointerEvent().changes.firstOrNull { it.id != down.id && it.pressed }
+                            }
+                        } else {
+                            null
                         }
 
                         if (secondPointer != null) {
@@ -954,16 +974,29 @@ fun TerminalWithAccessibility(
                                 }
                             }
 
+                            // When mouse mode is MOVE or DRAG, forward move events
+                            if (screenState.snapshot.mouseMode == MouseMode.MOVE ||
+                                (screenState.snapshot.mouseMode == MouseMode.DRAG && gestureType != GestureType.Undetermined)) {
+                                val scrollInfo = scrollInfoState.value
+                                val moveCol = (change.position.x / baseCharWidth).toInt()
+                                    .coerceIn(0, screenState.snapshot.cols - 1)
+                                val moveRow = rowFromY(change.position.y, scrollInfo)
+                                terminalEmulator.mouseMove(moveRow, moveCol, 0)
+                            }
+
                             // Determine gesture if still undetermined
                             if (gestureType == GestureType.Undetermined && !longPressDetected) {
                                 if (totalDistanceSquared > touchSlopSquared) {
                                     longPressJob?.cancel()
-                                    gestureType = if (absDx > absDy) {
+                                    // In mouse mode, don't start selection or scroll
+                                    gestureType = if (screenState.snapshot.mouseMode != MouseMode.NONE) {
+                                        GestureType.Scroll // Will be intercepted for mouse drag
+                                    } else if (absDx > absDy) {
                                         GestureType.HorizontalSwipe
                                     } else {
                                         GestureType.Scroll
                                     }
-                                    if (gestureType == GestureType.Scroll) {
+                                    if (gestureType == GestureType.Scroll && screenState.snapshot.mouseMode == MouseMode.NONE) {
                                         // Clear any active selection when scrolling starts
                                         if (selectionManager.mode != SelectionMode.NONE) {
                                             selectionManager.clearSelection()
@@ -1059,16 +1092,20 @@ fun TerminalWithAccessibility(
                             }
 
                             GestureType.Undetermined -> {
-                                // This is a tap. If a selection is active, clear it.
-                                // Otherwise, check for hyperlink or forward the tap.
-                                if (selectionManager.mode != SelectionMode.NONE) {
+                                val scrollInfo = scrollInfoState.value
+                                val tapCol = (down.position.x / baseCharWidth).toInt()
+                                    .coerceIn(0, screenState.snapshot.cols - 1)
+                                val tapRow = rowFromY(down.position.y, scrollInfo)
+
+                                // When mouse mode is active, forward tap as mouse click
+                                if (screenState.snapshot.mouseMode != MouseMode.NONE) {
+                                    terminalEmulator.mouseButton(1, true, 0)
+                                    terminalEmulator.mouseButton(1, false, 0)
+                                } else if (selectionManager.mode != SelectionMode.NONE) {
+                                    // If a selection is active, clear it.
                                     selectionManager.clearSelection()
                                 } else {
                                     // Check if tap is on a hyperlink
-                                    val scrollInfo = scrollInfoState.value
-                                    val tapCol = (down.position.x / baseCharWidth).toInt()
-                                        .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val tapRow = rowFromY(down.position.y, scrollInfo)
                                     val lineIndex = (scrollInfo.topLineIndex + tapRow)
                                         .coerceIn(0, screenState.totalLines - 1)
                                     val line = screenState.getLine(lineIndex)
@@ -1078,11 +1115,20 @@ fun TerminalWithAccessibility(
                                         // User tapped on a hyperlink
                                         onHyperlinkClick(hyperlinkUrl)
                                     } else {
-                                        // Request focus when terminal is tapped to show keyboard
-                                        if (keyboardEnabled) {
-                                            focusRequester.requestFocus()
+                                        // Fall back to implicit link detection
+                                        val implicitLink = ImplicitLinkDetector().detectLinkAt(line, tapCol)
+                                        if (implicitLink != null) {
+                                            onHyperlinkClick(implicitLink.url)
+                                        } else {
+                                            // Request focus when terminal is tapped to show keyboard.
+                                            // Skip when showSoftKeyboard is false — the host view
+                                            // manages keyboard externally and the redundant focus
+                                            // request would race with the host's keyboard dismiss.
+                                            if (keyboardEnabled && showSoftKeyboard) {
+                                                focusRequester.requestFocus()
+                                            }
+                                            onTerminalTap()
                                         }
-                                        onTerminalTap()
                                     }
                                 }
                             }
@@ -1165,6 +1211,37 @@ fun TerminalWithAccessibility(
                     selectionManager = selectionManager,
                     yOffset = scrollInfo.selectionYOffset
                 )
+
+                // Draw inline images
+                for (placement in screenState.snapshot.imagePlacements) {
+                    val imgX = placement.col * baseCharWidth
+                    val imgY = placement.row * baseCharHeight + scrollInfo.selectionYOffset
+                    val imgWidth = placement.widthCells * baseCharWidth
+                    val imgHeight = placement.heightCells * baseCharHeight
+                    drawContext.canvas.nativeCanvas.drawBitmap(
+                        placement.bitmap,
+                        null,
+                        android.graphics.RectF(imgX, imgY, imgX + imgWidth, imgY + imgHeight),
+                        null
+                    )
+                }
+
+                // Draw search highlights
+                for (highlight in screenState.snapshot.searchHighlights) {
+                    val hx = highlight.startCol * baseCharWidth
+                    val hy = highlight.row * baseCharHeight + scrollInfo.selectionYOffset
+                    val hw = (highlight.endCol - highlight.startCol) * baseCharWidth
+                    val highlightColor = if (highlight.isCurrent) {
+                        Color(0xFFFF9800.toInt()) // Orange for current match
+                    } else {
+                        Color(0x55FFFF00.toInt()) // Semi-transparent yellow
+                    }
+                    drawRect(
+                        color = highlightColor,
+                        topLeft = Offset(hx, hy),
+                        size = Size(hw, baseCharHeight)
+                    )
+                }
 
                 // Draw cursor (only when viewing current screen, not scrollback)
                 if (screenState.snapshot.cursorVisible && scrollOffset.value <= SCROLL_EPSILON_PX && cursorBlinkVisible) {
@@ -1360,8 +1437,15 @@ private fun DrawScope.drawLine(
             )
         }
 
-        // Draw character
-        if ((cell.char != ' ' && cell.char != '\u0000') || cell.combiningChars.isNotEmpty()) {
+        // Draw character - check for box drawing and block elements first
+        val codepoint = cell.char.code
+        if (BoxDrawingRenderer.isBoxDrawingChar(codepoint)) {
+            BoxDrawingRenderer.run {
+                drawBoxDrawingChar(codepoint, x, y, cellWidth, charHeight, fgColor)
+            }
+        } else if (isBlockElement(codepoint)) {
+            drawBlockElement(codepoint, x, y, cellWidth, charHeight, fgColor, bgColor)
+        } else if ((cell.char != ' ' && cell.char != '\u0000') || cell.combiningChars.isNotEmpty()) {
             val text = buildString {
                 append(if (cell.char == '\u0000') ' ' else cell.char)
                 cell.combiningChars.forEach { append(it) }
