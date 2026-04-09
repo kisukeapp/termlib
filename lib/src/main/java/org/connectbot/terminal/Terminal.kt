@@ -791,6 +791,9 @@ fun TerminalWithAccessibility(
                     kotlinx.coroutines.coroutineScope {
                         awaitEachGesture {
                         var gestureType: GestureType = GestureType.Undetermined
+                        // Accumulator for alt-screen scroll: each baseCharHeight worth
+                        // of vertical drag dispatches one cursor key to the running TUI.
+                        var altScrollAccumulator = 0f
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val downHostViewLocation = IntArray(2)
                         hostView.getLocationInWindow(downHostViewLocation)
@@ -1020,22 +1023,51 @@ fun TerminalWithAccessibility(
                                 }
 
                                 GestureType.Scroll -> {
-                                    // Update scroll offset
-                                    // Drag down (positive dragAmount.y) = view older content (increase scrollbackPosition)
-                                    // Drag up (negative dragAmount.y) = view newer content (decrease scrollbackPosition)
-                                    val oldOffset = scrollOffset.value
-                                    val newOffset = (oldOffset + dragAmount.y)
-                                        .coerceIn(0f, maxScrollPx)
-                                    coroutineScope.launch {
-                                        scrollOffset.snapTo(newOffset)
-                                    }
+                                    if (terminalEmulator.isAltScreenActive &&
+                                        screenState.snapshot.mouseMode == MouseMode.NONE) {
+                                        // SB-393: TUIs on the alternate screen (less, man,
+                                        // vim default, top, more, ...) don't have a meaningful
+                                        // local scrollback to drag — the scrollback list is
+                                        // empty because alt-screen output never gets pushed.
+                                        // Translate vertical drag into cursor up/down key
+                                        // presses for the running TUI. Same trick as iTerm2,
+                                        // kitty, alacritty's "alternate scroll mode" (DECSET 1007).
+                                        //
+                                        // Drag down (positive dragAmount.y) = reveal older
+                                        // content = press UP arrow.
+                                        // Drag up (negative dragAmount.y) = reveal newer
+                                        // content = press DOWN arrow.
+                                        //
+                                        // Skipped when mouseMode != NONE so we don't double-
+                                        // forward (drag is already sent as mouse motion above
+                                        // for MOVE/DRAG modes — see line ~977).
+                                        altScrollAccumulator += dragAmount.y
+                                        while (altScrollAccumulator >= baseCharHeight) {
+                                            terminalEmulator.dispatchKey(0, VTermKey.UP)
+                                            altScrollAccumulator -= baseCharHeight
+                                        }
+                                        while (altScrollAccumulator <= -baseCharHeight) {
+                                            terminalEmulator.dispatchKey(0, VTermKey.DOWN)
+                                            altScrollAccumulator += baseCharHeight
+                                        }
+                                    } else {
+                                        // Update scroll offset
+                                        // Drag down (positive dragAmount.y) = view older content (increase scrollbackPosition)
+                                        // Drag up (negative dragAmount.y) = view newer content (decrease scrollbackPosition)
+                                        val oldOffset = scrollOffset.value
+                                        val newOffset = (oldOffset + dragAmount.y)
+                                            .coerceIn(0f, maxScrollPx)
+                                        coroutineScope.launch {
+                                            scrollOffset.snapTo(newOffset)
+                                        }
 
-                                    // Update terminal buffer scrollback position
-                                    val scrolledLines =
-                                        (newOffset / baseCharHeight).toInt()
-                                    val oldScrollback = screenState.scrollbackPosition
-                                    val deltaLines = scrolledLines - oldScrollback
-                                    screenState.scrollBy(deltaLines)
+                                        // Update terminal buffer scrollback position
+                                        val scrolledLines =
+                                            (newOffset / baseCharHeight).toInt()
+                                        val oldScrollback = screenState.scrollbackPosition
+                                        val deltaLines = scrolledLines - oldScrollback
+                                        screenState.scrollBy(deltaLines)
+                                    }
                                 }
 
                                 else -> {}
@@ -1051,30 +1083,37 @@ fun TerminalWithAccessibility(
 
                         when (gestureType) {
                             GestureType.Scroll -> {
-                                // Apply fling animation
-                                val velocity = velocityTracker.calculateVelocity()
-                                coroutineScope.launch {
-                                    var targetValue = scrollOffset.targetValue
-                                    scrollOffset.animateDecay(
-                                        initialVelocity = velocity.y,
-                                        animationSpec = splineBasedDecay(density)
-                                    ) {
-                                        targetValue = value
-                                        // Update terminal buffer during animation
-                                        val scrolledLines =
-                                            (value / baseCharHeight).toInt()
-                                        val oldScrollback = screenState.scrollbackPosition
-                                        val deltaLines = scrolledLines - oldScrollback
-                                        screenState.scrollBy(deltaLines)
-                                    }
+                                if (terminalEmulator.isAltScreenActive &&
+                                    screenState.snapshot.mouseMode == MouseMode.NONE) {
+                                    // No fling on alt-scroll: cursor key dispatches happened
+                                    // synchronously during the drag, and there's no local
+                                    // scroll position to coast against.
+                                } else {
+                                    // Apply fling animation
+                                    val velocity = velocityTracker.calculateVelocity()
+                                    coroutineScope.launch {
+                                        var targetValue = scrollOffset.targetValue
+                                        scrollOffset.animateDecay(
+                                            initialVelocity = velocity.y,
+                                            animationSpec = splineBasedDecay(density)
+                                        ) {
+                                            targetValue = value
+                                            // Update terminal buffer during animation
+                                            val scrolledLines =
+                                                (value / baseCharHeight).toInt()
+                                            val oldScrollback = screenState.scrollbackPosition
+                                            val deltaLines = scrolledLines - oldScrollback
+                                            screenState.scrollBy(deltaLines)
+                                        }
 
-                                    // Clamp final position if needed
-                                    if (targetValue < 0f) {
-                                        scrollOffset.snapTo(0f)
-                                        screenState.scrollToBottom()
-                                    } else if (targetValue > maxScrollPx) {
-                                        scrollOffset.snapTo(maxScrollPx)
-                                        screenState.scrollToTop()
+                                        // Clamp final position if needed
+                                        if (targetValue < 0f) {
+                                            scrollOffset.snapTo(0f)
+                                            screenState.scrollToBottom()
+                                        } else if (targetValue > maxScrollPx) {
+                                            scrollOffset.snapTo(maxScrollPx)
+                                            screenState.scrollToTop()
+                                        }
                                     }
                                 }
                             }

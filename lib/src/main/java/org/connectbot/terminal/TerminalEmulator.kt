@@ -142,6 +142,18 @@ sealed interface TerminalEmulator {
      */
     val kittyKeyboardActive: Boolean
 
+    /**
+     * Whether the terminal is currently using the alternate screen buffer
+     * (DECSET 1049 / VTERM_PROP_ALTSCREEN).
+     *
+     * TUI apps like vim, less, htop, lazygit switch to the alternate screen
+     * so the user's shell history is preserved on exit. The UI layer uses
+     * this to decide whether scroll gestures should navigate the local
+     * scrollback (normal screen) or be forwarded to the running TUI as
+     * cursor key events (alternate screen with no mouse mode).
+     */
+    val isAltScreenActive: Boolean
+
     val dimensions: TerminalDimensions
 }
 
@@ -300,6 +312,11 @@ internal class TerminalEmulatorImpl(
     // Mouse mode tracking (set via setTermProp with VTERM_PROP_MOUSE)
     private var _mouseMode = MouseMode.NONE
     override val mouseMode: MouseMode get() = _mouseMode
+
+    // Alternate screen tracking (set via setTermProp with VTERM_PROP_ALTSCREEN, value 3)
+    @Volatile
+    private var _altScreenActive: Boolean = false
+    override val isAltScreenActive: Boolean get() = _altScreenActive
 
     // Synchronized output mode (CSI ? 2026 h/l)
     private var syncOutputActive = false
@@ -716,6 +733,12 @@ internal class TerminalEmulatorImpl(
                         2 -> {
                             cursorBlink = value.value
                             propertyChanged = true
+                        }
+                        // Property 3 is VTERM_PROP_ALTSCREEN (from vterm.h line 256).
+                        // Used by the UI to enable alt-scroll-mode emulation
+                        // (translate touch drag → cursor up/down keys for less/man/vim).
+                        3 -> {
+                            _altScreenActive = value.value
                         }
                     }
                 }
