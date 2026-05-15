@@ -202,20 +202,6 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     }
 
     /**
-     * Get the continuation (soft wrap) status for a visible screen line.
-     *
-     * A line is a "continuation" if it continues from the previous line due to
-     * text wrapping, rather than starting after a hard newline.
-     *
-     * @param row Row index (0-based)
-     * @return true if this line is a continuation of the previous line
-     */
-    fun getLineContinuation(row: Int): Boolean {
-        checkNotClosed()
-        return nativeGetLineContinuation(nativePtr, row)
-    }
-
-    /**
      * Enable or disable bold-as-bright color promotion.
      *
      * When enabled, bold text using low-intensity ANSI colors (0–7) promotes

@@ -448,40 +448,40 @@ bool Terminal::dispatchCharacter(int modifiers, int codepoint) {
 
 // Mouse input
 void Terminal::mouseMove(int row, int col, int modifiers) {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     vterm_mouse_move(mVt, row, col, buildModifier(modifiers));
 }
 
 void Terminal::mouseButton(int button, bool pressed, int modifiers) {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     vterm_mouse_button(mVt, button, pressed, buildModifier(modifiers));
 }
 
 // Bracketed paste
 void Terminal::startPaste() {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     vterm_keyboard_start_paste(mVt);
 }
 
 void Terminal::endPaste() {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     vterm_keyboard_end_paste(mVt);
 }
 
 // Focus reporting
 void Terminal::focusIn() {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     VTermState* state = vterm_obtain_state(mVt);
     if (state) vterm_state_focus_in(state);
 }
 
 void Terminal::focusOut() {
-    std::lock_guard<std::recursive_mutex> lock(mLock);
+    std::scoped_lock lock(mLock);
     if (!mVt) return;
     VTermState* state = vterm_obtain_state(mVt);
     if (state) vterm_state_focus_out(state);

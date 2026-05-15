@@ -268,12 +268,12 @@ internal class KeyboardHandler(
         // When kitty keyboard protocol is active, encode keys as CSI-u sequences
         if (terminalEmulator.kittyKeyboardActive) {
             val vtermKey = mapToVTermKey(key)
-            val char = getCharacterFromKey(key, shift || modifierManager?.isShiftActive() == true)
-            val codepoint = vtermKey ?: char?.code ?: return false
+            val codepoint = vtermKey ?: return false
+            val kittyMods = buildModifierMask(ctrl, alt, shift)
 
             val encoded = kittyEncoder.encode(
                 codepoint = codepoint,
-                modifiers = modifiers,
+                modifiers = kittyMods,
                 eventType = KittyKeyboardEncoder.EventType.PRESS,
                 flags = KittyKeyboardFlags.DISAMBIGUATE
             )
