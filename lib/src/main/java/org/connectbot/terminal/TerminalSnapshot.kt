@@ -23,9 +23,9 @@ import androidx.compose.ui.graphics.Color
  * Cursor shape types matching libvterm's VTERM_PROP_CURSORSHAPE values.
  */
 internal enum class CursorShape {
-    BLOCK,       // VTERM_PROP_CURSORSHAPE_BLOCK = 1
-    UNDERLINE,   // VTERM_PROP_CURSORSHAPE_UNDERLINE = 2
-    BAR_LEFT     // VTERM_PROP_CURSORSHAPE_BAR_LEFT = 3
+    BLOCK, // VTERM_PROP_CURSORSHAPE_BLOCK = 1
+    UNDERLINE, // VTERM_PROP_CURSORSHAPE_UNDERLINE = 2
+    BAR_LEFT, // VTERM_PROP_CURSORSHAPE_BAR_LEFT = 3
 }
 
 /**
@@ -68,7 +68,7 @@ internal data class TerminalSnapshot(
     val mouseMode: MouseMode = MouseMode.NONE,
     val searchHighlights: List<SearchHighlight> = emptyList(),
     val imagePlacements: List<ImagePlacement> = emptyList(),
-    val commandLineInfo: CommandLineInfo? = null
+    val commandLineInfo: CommandLineInfo? = null,
 ) {
     companion object {
         /**
@@ -78,25 +78,23 @@ internal data class TerminalSnapshot(
             rows: Int = 24,
             cols: Int = 80,
             defaultFg: Color = Color.White,
-            defaultBg: Color = Color.Black
-        ): TerminalSnapshot {
-            return TerminalSnapshot(
-                lines = List(rows) { row ->
-                    TerminalLine.empty(row, cols, defaultFg, defaultBg)
-                },
-                scrollback = emptyList(),
-                cursorRow = 0,
-                cursorCol = 0,
-                cursorVisible = true,
-                cursorBlink = true,
-                cursorShape = CursorShape.BLOCK,
-                terminalTitle = "",
-                rows = rows,
-                cols = cols,
-                timestamp = System.currentTimeMillis(),
-                sequenceNumber = 0L
-            )
-        }
+            defaultBg: Color = Color.Black,
+        ): TerminalSnapshot = TerminalSnapshot(
+            lines = List(rows) { row ->
+                TerminalLine.empty(row, cols, defaultFg, defaultBg)
+            },
+            scrollback = emptyList(),
+            cursorRow = 0,
+            cursorCol = 0,
+            cursorVisible = true,
+            cursorBlink = true,
+            cursorShape = CursorShape.BLOCK,
+            terminalTitle = "",
+            rows = rows,
+            cols = cols,
+            timestamp = System.currentTimeMillis(),
+            sequenceNumber = 0L,
+        )
     }
 }
 

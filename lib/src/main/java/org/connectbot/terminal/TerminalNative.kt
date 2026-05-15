@@ -16,6 +16,7 @@
  */
 package org.connectbot.terminal
 
+import java.io.File
 import java.nio.ByteBuffer
 
 /**
@@ -201,6 +202,34 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     }
 
     /**
+     * Get the continuation (soft wrap) status for a visible screen line.
+     *
+     * A line is a "continuation" if it continues from the previous line due to
+     * text wrapping, rather than starting after a hard newline.
+     *
+     * @param row Row index (0-based)
+     * @return true if this line is a continuation of the previous line
+     */
+    fun getLineContinuation(row: Int): Boolean {
+        checkNotClosed()
+        return nativeGetLineContinuation(nativePtr, row)
+    }
+
+    /**
+     * Enable or disable bold-as-bright color promotion.
+     *
+     * When enabled, bold text using low-intensity ANSI colors (0–7) promotes
+     * to the corresponding bright palette color (8–15), matching xterm behavior.
+     *
+     * @param enabled true to enable bold-as-bright, false to disable
+     * @return 0 on success, -1 on error
+     */
+    fun setBoldHighbright(enabled: Boolean): Int {
+        checkNotClosed()
+        return nativeSetBoldHighbright(nativePtr, enabled)
+    }
+
+    /**
      * Close the terminal and release native resources.
      * After calling this, the Terminal instance cannot be used.
      */
@@ -236,6 +265,7 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     private external fun nativeSetLineContinuation(ptr: Long, row: Int, continuation: Boolean)
     private external fun nativeSetPaletteColors(ptr: Long, colors: IntArray, count: Int): Int
     private external fun nativeSetDefaultColors(ptr: Long, fgColor: Int, bgColor: Int): Int
+    private external fun nativeSetBoldHighbright(ptr: Long, enabled: Boolean): Int
     private external fun nativeMouseMove(ptr: Long, row: Int, col: Int, modifiers: Int)
     private external fun nativeMouseButton(ptr: Long, button: Int, pressed: Boolean, modifiers: Int)
     private external fun nativeStartPaste(ptr: Long)
@@ -244,12 +274,39 @@ internal class TerminalNative(callbacks: TerminalCallbacks) : AutoCloseable {
     private external fun nativeFocusOut(ptr: Long)
 
     companion object {
+        private const val LIBRARY_NAME = "jni_cb_term"
+
         init {
+            loadNativeLibrary()
+        }
+
+        private fun loadNativeLibrary() {
             try {
-                System.loadLibrary("jni_cb_term")
-            } catch (e: Exception) {
-                System.err.println("Failed to load JNI library: ${e.message}")
+                System.loadLibrary(LIBRARY_NAME)
+            } catch (e: UnsatisfiedLinkError) {
+                if (!e.message.orEmpty().contains("already loaded in another classloader")) {
+                    throw e
+                }
+
+                loadCopiedNativeLibrary(e)
             }
+        }
+
+        private fun loadCopiedNativeLibrary(cause: UnsatisfiedLinkError) {
+            val mappedName = System.mapLibraryName(LIBRARY_NAME)
+            val source = System.getProperty("java.library.path")
+                .orEmpty()
+                .split(File.pathSeparator)
+                .asSequence()
+                .filter { it.isNotBlank() }
+                .map { File(it, mappedName) }
+                .firstOrNull { it.isFile }
+                ?: throw cause
+
+            val target = File.createTempFile("${LIBRARY_NAME}-", "-$mappedName")
+            target.deleteOnExit()
+            source.copyTo(target, overwrite = true)
+            System.load(target.absolutePath)
         }
     }
 }

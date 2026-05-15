@@ -16,6 +16,8 @@
  */
 package org.connectbot.terminal
 
+import androidx.compose.runtime.Immutable
+
 /**
  * Semantic type for terminal content, derived from shell integration sequences.
  *
@@ -42,7 +44,7 @@ internal enum class SemanticType {
     ANNOTATION,
 
     /** Hyperlink (OSC 8) - metadata contains the URL */
-    HYPERLINK
+    HYPERLINK,
 }
 
 /**
@@ -59,12 +61,13 @@ internal enum class SemanticType {
  * @param metadata Optional metadata (e.g., exit code for COMMAND_FINISHED)
  * @param promptId Groups segments that belong to the same command execution
  */
+@Immutable
 internal data class SemanticSegment(
     val startCol: Int,
     val endCol: Int,
     val semanticType: SemanticType,
     val metadata: String? = null,
-    val promptId: Int = -1
+    val promptId: Int = -1,
 ) {
     /**
      * Check if a column is within this segment's range.

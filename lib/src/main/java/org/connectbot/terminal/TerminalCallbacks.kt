@@ -19,8 +19,12 @@ package org.connectbot.terminal
 /**
  * Callbacks invoked by the native terminal layer when terminal state changes.
  *
- * IMPORTANT: Callbacks MUST NOT call back into Terminal methods, as the native
- * mutex is not reentrant. This will cause a deadlock.
+ * IMPORTANT: These callbacks may be invoked while native Terminal state is guarded by
+ * a non-reentrant mutex. Implementations MUST NOT synchronously call back into
+ * TerminalNative or TerminalEmulator methods that enter native code, such as
+ * writeInput(), resize(), dispatchKey(), dispatchCharacter(), getCellRun(), or
+ * getLineContinuation(). Post or otherwise defer that work until after the callback
+ * returns.
  */
 internal interface TerminalCallbacks {
     /**
@@ -76,7 +80,10 @@ internal interface TerminalCallbacks {
      *
      * @param cols Number of screen columns at capture time
      * @param cells Array of screen cells
-     * @param continuation True if this line is a continuation of the previous line (line wrapping)
+     * @param continuation True if this line is a continuation of the previous line (line wrapping),
+     *                     false if it starts after a hard newline. Maps to libvterm's
+     *                     `VTermLineInfo.continuation`. Used when copying text to avoid spurious
+     *                     newlines in wrapped commands and to rejoin logical lines during reflow.
      * @return 0 on success
      */
     fun pushScrollbackLine(cols: Int, cells: Array<ScreenCell>, continuation: Boolean): Int
@@ -89,6 +96,13 @@ internal interface TerminalCallbacks {
      * @return 0 if no scrollback, 1 if line popped (not continuation), 2 if line popped (continuation)
      */
     fun popScrollbackLine(cols: Int, cells: Array<ScreenCell>): Int
+
+    /**
+     * Called when the entire scrollback buffer should be cleared.
+     *
+     * @return 0 on success
+     */
+    fun clearScrollback(): Int
 
     /**
      * Called when keyboard input is generated (user types, terminal generates escape sequences).
@@ -153,7 +167,7 @@ internal data class TermRect(
     val startRow: Int,
     val endRow: Int,
     val startCol: Int,
-    val endCol: Int
+    val endCol: Int,
 )
 
 /**
@@ -161,7 +175,7 @@ internal data class TermRect(
  */
 internal data class CursorPosition(
     val row: Int,
-    val col: Int
+    val col: Int,
 )
 
 /**
@@ -188,8 +202,10 @@ internal data class ScreenCell(
     val bgBlue: Int,
     val bold: Boolean = false,
     val italic: Boolean = false,
-    val underline: Int = 0,  // 0=none, 1=single, 2=double
+    // 0=none, 1=single, 2=double
+    val underline: Int = 0,
     val reverse: Boolean = false,
     val strike: Boolean = false,
-    val width: Int = 1  // 1 for normal, 2 for fullwidth (CJK)
+    // 1 for normal, 2 for fullwidth (CJK)
+    val width: Int = 1,
 )

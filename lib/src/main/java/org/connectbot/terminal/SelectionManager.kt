@@ -32,9 +32,9 @@ interface SelectionController {
 
     /**
      * Start selection mode at the current cursor position or center of screen.
-     * @param mode The selection mode to use (BLOCK or LINE)
+     * @param mode The selection mode to use (CHARACTER, WORD, or LINE)
      */
-    fun startSelection(mode: SelectionMode = SelectionMode.BLOCK)
+    fun startSelection(mode: SelectionMode = SelectionMode.CHARACTER)
 
     /**
      * Toggle selection mode on/off. If off, turns it on. If on, turns it off.
@@ -62,9 +62,19 @@ interface SelectionController {
     fun moveSelectionRight()
 
     /**
-     * Toggle between BLOCK and LINE selection modes.
+     * Toggle between CHARACTER, WORD, and LINE selection modes.
      */
     fun toggleSelectionMode()
+
+    /**
+     * Set the selection mode directly.
+     */
+    fun setSelectionMode(mode: SelectionMode)
+
+    /**
+     * Select all text in the terminal.
+     */
+    fun selectAll()
 
     /**
      * Finish the selection (stop extending it, but keep it active for copying).
@@ -83,17 +93,18 @@ interface SelectionController {
     fun clearSelection()
 }
 
-enum class SelectionMode {
-    NONE,
-    BLOCK,
-    LINE
+sealed class SelectionMode {
+    data object NONE : SelectionMode()
+    data object CHARACTER : SelectionMode()
+    data object WORD : SelectionMode()
+    data object LINE : SelectionMode()
 }
 
 internal data class SelectionRange(
     val startRow: Int,
     val startCol: Int,
     val endRow: Int,
-    val endCol: Int
+    val endCol: Int,
 ) {
     fun contains(row: Int, col: Int): Boolean {
         val minRow = minOf(startRow, endRow)
@@ -128,7 +139,7 @@ internal data class SelectionRange(
 }
 
 internal class SelectionManager {
-    var mode by mutableStateOf(SelectionMode.NONE)
+    var mode by mutableStateOf<SelectionMode>(SelectionMode.NONE)
         private set
 
     var selectionRange by mutableStateOf<SelectionRange?>(null)
@@ -137,10 +148,18 @@ internal class SelectionManager {
     var isSelecting by mutableStateOf(false)
         private set
 
-    fun startSelection(row: Int, col: Int, mode: SelectionMode = SelectionMode.BLOCK) {
+    fun startSelection(
+        row: Int,
+        col: Int,
+        cols: Int,
+        mode: SelectionMode = SelectionMode.CHARACTER,
+        snapshot: TerminalSnapshot? = null,
+        scrollbackPosition: Int = 0,
+    ) {
         this.mode = mode
         isSelecting = true
         selectionRange = SelectionRange(row, col, row, col)
+        adjustSelectionForMode(cols, snapshot, scrollbackPosition)
     }
 
     fun updateSelection(row: Int, col: Int) {
@@ -226,55 +245,171 @@ internal class SelectionManager {
         isSelecting = false
     }
 
-    fun toggleMode(cols: Int) {
+    fun toggleMode(cols: Int, snapshot: TerminalSnapshot? = null, scrollbackPosition: Int = 0) {
         mode = when (mode) {
-            SelectionMode.BLOCK -> SelectionMode.LINE
-            SelectionMode.LINE -> SelectionMode.BLOCK
-            SelectionMode.NONE -> SelectionMode.BLOCK
+            SelectionMode.CHARACTER -> SelectionMode.WORD
+            SelectionMode.WORD -> SelectionMode.LINE
+            SelectionMode.LINE -> SelectionMode.CHARACTER
+            SelectionMode.NONE -> SelectionMode.CHARACTER
         }
 
-        // Adjust selection range for line mode
-        if (mode == SelectionMode.LINE && selectionRange != null) {
-            val range = selectionRange!!
-            selectionRange = range.copy(
-                startCol = 0,
-                endCol = cols - 1
-            )
+        adjustSelectionForMode(cols, snapshot, scrollbackPosition)
+    }
+
+    fun setMode(newMode: SelectionMode, cols: Int, snapshot: TerminalSnapshot? = null, scrollbackPosition: Int = 0) {
+        mode = newMode
+        adjustSelectionForMode(cols, snapshot, scrollbackPosition)
+    }
+
+    fun selectAll(rows: Int, cols: Int) {
+        mode = SelectionMode.CHARACTER
+        isSelecting = false
+        selectionRange = SelectionRange(0, 0, rows - 1, cols - 1)
+    }
+
+    /**
+     * Clamps the selection range to the given dimensions.
+     * Useful when the terminal is resized.
+     */
+    fun clampToDimensions(rows: Int, cols: Int) {
+        val range = selectionRange ?: return
+        val newStartRow = range.startRow.coerceAtMost(rows - 1)
+        val newEndRow = range.endRow.coerceAtMost(rows - 1)
+        val newStartCol = range.startCol.coerceAtMost(cols - 1)
+        val newEndCol = range.endCol.coerceAtMost(cols - 1)
+
+        if (newStartRow != range.startRow || newEndRow != range.endRow ||
+            newStartCol != range.startCol || newEndCol != range.endCol
+        ) {
+            selectionRange = SelectionRange(newStartRow, newStartCol, newEndRow, newEndCol)
         }
     }
 
-    fun getSelectedText(snapshot: TerminalSnapshot, topLineIndex: Int = 0): String {
+    internal fun adjustSelectionForMode(cols: Int, snapshot: TerminalSnapshot?, scrollbackPosition: Int = 0) {
+        val range = selectionRange ?: return
+
+        when (mode) {
+            SelectionMode.LINE -> {
+                selectionRange = range.copy(
+                    startCol = 0,
+                    endCol = cols - 1,
+                )
+            }
+
+            SelectionMode.WORD -> {
+                if (snapshot != null) {
+                    val startLine = getSnapshotLine(snapshot, range.startRow, scrollbackPosition)
+                    val endLine = getSnapshotLine(snapshot, range.endRow, scrollbackPosition)
+
+                    if (startLine != null && endLine != null) {
+                        val (newStartCol, _) = findWordBoundaries(startLine, range.startCol)
+                        val (_, newEndCol) = findWordBoundaries(endLine, range.endCol)
+
+                        selectionRange = range.copy(
+                            startCol = newStartCol,
+                            endCol = newEndCol,
+                        )
+                    }
+                }
+            }
+
+            SelectionMode.CHARACTER, SelectionMode.NONE -> {
+                // No adjustment needed
+            }
+        }
+    }
+
+    private fun getSnapshotLine(snapshot: TerminalSnapshot, row: Int, scrollbackPosition: Int = 0): TerminalLine? = if (scrollbackPosition > 0) {
+        val scrollbackIndex = snapshot.scrollback.size - scrollbackPosition + row
+        snapshot.scrollback.getOrNull(scrollbackIndex)
+    } else {
+        snapshot.lines.getOrNull(row)
+    }
+
+    private fun isWordChar(char: Char): Boolean = char.isLetterOrDigit() || char == '_'
+
+    private fun findWordBoundaries(line: TerminalLine, col: Int): Pair<Int, Int> {
+        val cells = line.cells
+        if (cells.isEmpty()) return Pair(0, 0)
+        val safeCol = col.coerceIn(0, cells.lastIndex)
+
+        // If the touch is in trailing whitespace with no word to the right, snap to the last word.
+        if (!isWordChar(cells[safeCol].char)) {
+            val lastWordEnd = cells.indices.lastOrNull { isWordChar(cells[it].char) }
+            if (lastWordEnd != null && lastWordEnd < safeCol) {
+                var start = lastWordEnd
+                while (start > 0 && isWordChar(cells[start - 1].char)) start--
+                return Pair(start, lastWordEnd)
+            }
+        }
+
+        val startChar = cells[safeCol].char
+        val targetingWord = isWordChar(startChar)
+
+        var start = safeCol
+        while (start > 0 && isWordChar(cells[start - 1].char) == targetingWord) {
+            start--
+        }
+
+        var end = safeCol
+        while (end < cells.size - 1 && isWordChar(cells[end + 1].char) == targetingWord) {
+            end++
+        }
+
+        return Pair(start, end)
+    }
+
+    private fun isBlankCell(cell: TerminalLine.Cell): Boolean = (cell.char == ' ' || cell.char == '\u0000') && cell.combiningChars.isEmpty()
+
+    private fun lastContentCol(line: TerminalLine): Int {
+        var last = line.cells.lastIndex
+        while (last > 0 && isBlankCell(line.cells[last])) last--
+        return last
+    }
+
+    fun getSelectedText(snapshot: TerminalSnapshot, scrollbackPosition: Int = 0): String {
         val range = selectionRange ?: return ""
 
         val minRow = minOf(range.startRow, range.endRow)
         val maxRow = maxOf(range.startRow, range.endRow)
         val totalLines = snapshot.scrollback.size + snapshot.lines.size
 
+        fun lineAt(absRow: Int): TerminalLine? {
+            val idx = (scrollbackPosition + absRow).coerceIn(0, totalLines - 1)
+            return if (idx < snapshot.scrollback.size) {
+                snapshot.scrollback[idx]
+            } else {
+                snapshot.lines.getOrNull(idx - snapshot.scrollback.size)
+            }
+        }
+
+        // The line.continuation flag (libvterm's VTermLineInfo.continuation semantics) is
+        // true if THIS line continues from the previous one. So the boundary between row
+        // and row+1 is a hard line break iff row+1 is NOT a continuation.
+        fun shouldEmitNewline(row: Int): Boolean {
+            if (row >= maxRow) return false
+            val next = lineAt(row + 1) ?: return true
+            return !next.continuation
+        }
+
         return buildString {
             for (row in minRow..maxRow) {
-                val lineIndex = (topLineIndex + row).coerceIn(0, totalLines - 1)
-                val line = if (lineIndex < snapshot.scrollback.size) {
-                    snapshot.scrollback[lineIndex]
-                } else {
-                    val screenIndex = lineIndex - snapshot.scrollback.size
-                    snapshot.lines.getOrNull(screenIndex)
-                }
-
-                if (line == null) continue
+                val line = lineAt(row) ?: continue
 
                 when (mode) {
                     SelectionMode.LINE -> {
+                        // Build line text and trim trailing whitespace.
                         val lineText = buildString {
                             line.cells.forEach { cell ->
-                                val ch = if (cell.char == '\u0000') ' ' else cell.char
-                                append(ch)
+                                append(cell.char)
                                 cell.combiningChars.forEach { append(it) }
                             }
-                        }.trimEnd { it == ' ' || it == '\u0000' }
+                        }.trimEnd()
                         append(lineText)
-                        if (row < maxRow) append('\n')
+                        if (shouldEmitNewline(row)) append('\n')
                     }
-                    SelectionMode.BLOCK -> {
+
+                    SelectionMode.CHARACTER, SelectionMode.WORD -> {
                         val startCol = when (row) {
                             minRow -> minOf(range.startCol, range.endCol)
                             else -> 0
@@ -284,21 +419,25 @@ internal class SelectionManager {
                             else -> line.cells.size - 1
                         }
 
-                        for (col in startCol..minOf(endCol, line.cells.lastIndex)) {
-                            val cell = line.cells[col]
-                            val ch = if (cell.char == '\u0000') ' ' else cell.char
-                            append(ch)
-                            cell.combiningChars.forEach { append(it) }
-                        }
-                        if (row < maxRow) append('\n')
+                        // Build line text and trim trailing whitespace
+                        val lineText = buildString {
+                            for (col in startCol..minOf(endCol, line.cells.lastIndex)) {
+                                val cell = line.cells[col]
+                                append(cell.char)
+                                cell.combiningChars.forEach { append(it) }
+                            }
+                        }.trimEnd()
+                        append(lineText)
+                        if (shouldEmitNewline(row)) append('\n')
                     }
+
                     SelectionMode.NONE -> {}
                 }
             }
         }.trim()
     }
 
-    fun isCellSelected(row: Int, col: Int): Boolean {
+    fun isCellSelected(row: Int, col: Int, line: TerminalLine? = null): Boolean {
         val range = selectionRange ?: return false
         return when (mode) {
             SelectionMode.LINE -> {
@@ -306,7 +445,12 @@ internal class SelectionManager {
                 val maxRow = maxOf(range.startRow, range.endRow)
                 row in minRow..maxRow
             }
-            SelectionMode.BLOCK -> range.contains(row, col)
+
+            SelectionMode.CHARACTER, SelectionMode.WORD -> {
+                if (line != null && col > lastContentCol(line)) return false
+                range.contains(row, col)
+            }
+
             SelectionMode.NONE -> false
         }
     }
