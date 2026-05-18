@@ -318,6 +318,12 @@ int Terminal::writeInput(const uint8_t* data, size_t length) {
 int Terminal::resize(int rows, int cols) {
     std::scoped_lock lock(mLock);
 
+    // libvterm aborts in screen.c resize if rows/cols < 1 (cursor invariant fails).
+    if (rows < 1 || cols < 1) {
+        LOGE("resize: ignoring invalid size %dx%d", rows, cols);
+        return 0;
+    }
+
     mRows = rows;
     mCols = cols;
 
