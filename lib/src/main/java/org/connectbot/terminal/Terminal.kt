@@ -18,6 +18,9 @@ package org.connectbot.terminal
 
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager as AndroidClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Paint
 import android.graphics.Path
@@ -116,6 +119,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.ceil
 
 private val DRAW_TEXT_BUFFER = ThreadLocal.withInitial { CharArray(1) }
@@ -130,6 +134,10 @@ private enum class GestureType {
     Selection,
     Zoom,
     HandleDrag,
+    // Horizontal-dominant pan reserved for the parent container (e.g. RN drawer).
+    // We deliberately do NOT consume pointer changes once we enter this state so
+    // RNGH PanGestureHandler can follow the finger.
+    HorizontalSwipe,
 }
 
 /**
@@ -141,6 +149,14 @@ private const val CURSOR_BLINK_RATE_MS = 500L
  * Amount of time to wait for second touch to detect multitouch gesture in milliseconds.
  */
 private const val WAIT_FOR_SECOND_TOUCH_MS = 40L
+
+/**
+ * Grace window after the long-press timer fires. If the finger lifts within this many
+ * milliseconds (and there has been no drag), the would-be selection is cancelled and
+ * the gesture is treated as a tap. Acts as a safety net for "slow taps" that exceed the
+ * stock 500 ms long-press timeout but were never intended to start a selection.
+ */
+private const val LONG_PRESS_COMMIT_MS = 0L
 
 /**
  * Text selection magnifier loupe size in dp.
@@ -327,6 +343,8 @@ fun Terminal(
     onPasteRequest: (() -> Unit)? = null,
     rightAltMode: RightAltMode = RightAltMode.CharacterModifier,
     delKeyMode: DelKeyMode = DelKeyMode.Delete,
+    pinchZoomEnabled: Boolean = true,
+    simpleSelectionToolbar: Boolean = false,
 ) {
     if (LocalInspectionMode.current) {
         TerminalPreview(modifier, backgroundColor, foregroundColor)
@@ -358,6 +376,8 @@ fun Terminal(
         selectionBackgroundColor = selectionBackgroundColor,
         selectionForegroundColor = selectionForegroundColor,
         delKeyMode = delKeyMode,
+        pinchZoomEnabled = pinchZoomEnabled,
+        simpleSelectionToolbar = simpleSelectionToolbar,
     )
 }
 
@@ -394,6 +414,8 @@ internal fun TerminalWithAccessibility(
     selectionBackgroundColor: Color = Color(0xFFB3D7FF),
     selectionForegroundColor: Color = Color.Black,
     delKeyMode: DelKeyMode = DelKeyMode.Delete,
+    pinchZoomEnabled: Boolean = true,
+    simpleSelectionToolbar: Boolean = false,
 ) {
     if (terminalEmulator !is TerminalEmulatorImpl) {
         Box(
@@ -413,6 +435,7 @@ internal fun TerminalWithAccessibility(
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val clipboardManager = LocalClipboardManager.current
+    val composeContext = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val scope = rememberCoroutineScope()
 
@@ -635,7 +658,15 @@ internal fun TerminalWithAccessibility(
             override fun copySelection(): String {
                 val text = selectionManager.getSelectedText(screenState.snapshot, screenState.scrollbackPosition)
                 if (text.isNotEmpty()) {
-                    clipboardManager.setText(AnnotatedString(text))
+                    try {
+                        clipboardManager.setText(AnnotatedString(text))
+                    } catch (e: Throwable) {
+                    }
+                    try {
+                        val androidCm = composeContext.getSystemService(Context.CLIPBOARD_SERVICE) as? AndroidClipboardManager
+                        androidCm?.setPrimaryClip(ClipData.newPlainText("terminal_selection", text))
+                    } catch (e: Throwable) {
+                    }
                     selectionManager.clearSelection()
                 }
                 return text
@@ -925,6 +956,12 @@ internal fun TerminalWithAccessibility(
                 ).pointerInput(terminalEmulator, baseCharWidth, baseCharHeight) {
                 val touchSlopSquared =
                     viewConfiguration.touchSlop * viewConfiguration.touchSlop
+                // Stricter threshold than touchSlop: if the finger moves even slightly we
+                // cancel the long-press timer. Without this, IME-animation jitter and tiny
+                // drifts during a "tap" can pass the long-press window and surface the
+                // selection toolbar instead of toggling the keyboard.
+                val stationaryThresholdPx = viewConfiguration.touchSlop / 3f
+                val stationaryThresholdSquared = stationaryThresholdPx * stationaryThresholdPx
                 var scrollJob: Job? = null
                 coroutineScope {
                     awaitEachGesture {
@@ -933,8 +970,10 @@ internal fun TerminalWithAccessibility(
                         scrollJob?.cancel()
 
                         // 1a. Check for double-tap to start word selection
-                        val isDoubleTap = (down.uptimeMillis - tapTracker.lastTimestamp) < viewConfiguration.doubleTapTimeoutMillis &&
-                            (down.position - tapTracker.lastPosition).getDistanceSquared() < touchSlopSquared
+                        val dtDelta = down.uptimeMillis - tapTracker.lastTimestamp
+                        val dtDistSq = (down.position - tapTracker.lastPosition).getDistanceSquared()
+                        val doubleTapTimeout = viewConfiguration.doubleTapTimeoutMillis
+                        val isDoubleTap = dtDelta < doubleTapTimeout && dtDistSq < touchSlopSquared
 
                         if (isDoubleTap) {
                             gestureType = GestureType.Selection
@@ -962,15 +1001,23 @@ internal fun TerminalWithAccessibility(
                                 if (touchingStart || touchingEnd) {
                                     gestureType = GestureType.HandleDrag
                                     isDraggingHandle = true
-                                    // Handle drag
-                                    showMagnifier = true
-                                    magnifierPosition = down.position
 
                                     // Local variable to keep track of which handle we are moving in case they cross
                                     var isMovingStart = touchingStart
+                                    var anyDragHappened = false
 
                                     try {
                                         drag(down.id) { change ->
+                                            if (!anyDragHappened) {
+                                                anyDragHappened = true
+                                                // Only show the magnifier once the user actually
+                                                // drags — otherwise a stationary tap on a 1-char
+                                                // selection's overlapping handles flashes the
+                                                // magnifier even though the user just meant to
+                                                // tap somewhere on the terminal.
+                                                showMagnifier = true
+                                                magnifierPosition = down.position
+                                            }
                                             val newCol =
                                                 (change.position.x / baseCharWidth).toInt()
                                                     .coerceIn(0, screenState.snapshot.cols - 1)
@@ -1006,6 +1053,25 @@ internal fun TerminalWithAccessibility(
                                         isDraggingHandle = false
                                     }
 
+                                    if (!anyDragHappened) {
+                                        // User tapped on a handle but never dragged. Treat as a
+                                        // tap on the terminal: clear the selection (so the
+                                        // toolbar disappears) and forward the tap so the
+                                        // keyboard toggles. Without this, a tap landing on the
+                                        // overlapping handles of a 1-char selection just
+                                        // dismisses the toolbar — the user has to tap again to
+                                        // toggle the keyboard.
+                                        selectionManager.clearSelection()
+                                        if (keyboardEnabled) {
+                                            focusRequester.requestFocus()
+                                        }
+                                        currentOnTerminalTap()
+                                        tapTracker.lastTimestamp = down.uptimeMillis
+                                        tapTracker.lastPosition = down.position
+                                        showMagnifier = false
+                                        return@awaitEachGesture
+                                    }
+
                                     // After lifting finger, ensure selection is fully adjusted and handles snap
                                     selectionManager.adjustSelectionForMode(
                                         screenState.snapshot.cols,
@@ -1020,22 +1086,32 @@ internal fun TerminalWithAccessibility(
                             }
                         }
 
-                        // 2. Start long press detection for selection
-                        // Only start selection if no selection is already active
+                        // 2. Start long press detection for selection.
+                        // Long-press should only fire when the finger has stayed (nearly) still
+                        // for the long-press timeout. `movedBeyondStationaryThreshold` is the
+                        // gate the event loop flips as soon as the finger drifts past
+                        // `stationaryThresholdPx`. Without this gate, IME-show animations and
+                        // tiny finger jitter on a normal tap can clear the long-press timeout
+                        // and surface the selection toolbar instead of toggling the keyboard.
                         var longPressDetected = false
                         var gestureEnded = false
+                        var movedBeyondStationaryThreshold = false
+                        // Wait `longPressTimeoutMillis + LONG_PRESS_COMMIT_MS` (typically 750 ms)
+                        // before showing the magnifier/selection. The 250 ms commit grace stops
+                        // "slow taps" (held briefly past the 500 ms long-press threshold) from
+                        // ever flashing the selection UI — the user perceives those as taps.
+                        val longPressTimerTotalMs = viewConfiguration.longPressTimeoutMillis + LONG_PRESS_COMMIT_MS
                         val longPressJob = if (gestureType == GestureType.Undetermined) {
                             launch {
-                                delay(viewConfiguration.longPressTimeoutMillis)
-                                // Only trigger long press if gesture is still undetermined AND still in progress
-                                if (gestureType == GestureType.Undetermined &&
+                                delay(longPressTimerTotalMs)
+                                val canFire = gestureType == GestureType.Undetermined &&
                                     selectionManager.mode == SelectionMode.NONE &&
-                                    !gestureEnded
-                                ) {
+                                    !gestureEnded &&
+                                    !movedBeyondStationaryThreshold
+                                if (canFire) {
                                     longPressDetected = true
                                     gestureType = GestureType.Selection
 
-                                    // Start selection
                                     val col = (down.position.x / baseCharWidth).toInt()
                                         .coerceIn(0, screenState.snapshot.cols - 1)
                                     val row = (down.position.y / baseCharHeight).toInt()
@@ -1075,6 +1151,13 @@ internal fun TerminalWithAccessibility(
                                 val change =
                                     event.changes.find { it.id == primaryPointerId } ?: event.changes.first()
 
+                                // Per-event trace — find latency between OS event and Compose seeing it
+                                val nowMs = android.os.SystemClock.uptimeMillis()
+                                val eventDtFromDown = change.uptimeMillis - down.uptimeMillis
+                                val processingLagMs = nowMs - change.uptimeMillis
+                                val numChanges = event.changes.size
+                                val allPressed = event.changes.all { it.pressed }
+
                                 // Track velocity for all events, including the final UP event.
                                 // addPointerInputChange handles historical positions for better accuracy.
                                 velocityTracker.addPointerInputChange(change)
@@ -1082,9 +1165,19 @@ internal fun TerminalWithAccessibility(
                                 val dragAmount = change.positionChange()
                                 panAccumulator += dragAmount
 
-                                // 4a. Check for multi-touch (zoom)
-                                // Only allow zoom if we are still undetermined and within the initial grace period.
-                                if (gestureType == GestureType.Undetermined && change.uptimeMillis <= multiTouchTimeout && event.changes.size > 1) {
+                                // Flip the stationary gate as soon as the finger drifts past
+                                // the small stationary threshold so the long-press timer
+                                // becomes a no-op even before we cross full touchSlop.
+                                if (!movedBeyondStationaryThreshold &&
+                                    panAccumulator.getDistanceSquared() > stationaryThresholdSquared
+                                ) {
+                                    movedBeyondStationaryThreshold = true
+                                }
+
+                                // 4a. Check for multi-touch (zoom).
+                                // Only allow zoom if pinch-to-zoom is enabled, we are still undetermined,
+                                // and we are within the initial grace period.
+                                if (pinchZoomEnabled && gestureType == GestureType.Undetermined && change.uptimeMillis <= multiTouchTimeout && event.changes.size > 1) {
                                     secondPointer =
                                         event.changes.firstOrNull { it.id != primaryPointerId && it.pressed }
                                     if (secondPointer != null) break
@@ -1097,13 +1190,22 @@ internal fun TerminalWithAccessibility(
 
                                     if (!isGracePeriod && panAccumulator.getDistanceSquared() > touchSlopSquared) {
                                         longPressJob?.cancel()
-                                        gestureType = GestureType.Scroll
-                                        isUserScrolling = true
-                                        // Adjust initialScrollOffset so (initial + panAccumulator) matches current offset
-                                        initialScrollOffset = scrollOffset.value - panAccumulator.y
-                                        // Clear any active selection when scrolling starts
-                                        if (selectionManager.mode != SelectionMode.NONE) {
-                                            selectionManager.clearSelection()
+                                        val absX = abs(panAccumulator.x)
+                                        val absY = abs(panAccumulator.y)
+                                        if (absX > absY) {
+                                            // Horizontal-dominant pan: yield to the parent
+                                            // container (e.g. RN drawer's PanGestureHandler)
+                                            // by NOT consuming subsequent pointer changes.
+                                            gestureType = GestureType.HorizontalSwipe
+                                        } else {
+                                            gestureType = GestureType.Scroll
+                                            isUserScrolling = true
+                                            // Adjust initialScrollOffset so (initial + panAccumulator) matches current offset
+                                            initialScrollOffset = scrollOffset.value - panAccumulator.y
+                                            // Clear any active selection when scrolling starts
+                                            if (selectionManager.mode != SelectionMode.NONE) {
+                                                selectionManager.clearSelection()
+                                            }
                                         }
                                     }
                                 }
@@ -1156,7 +1258,16 @@ internal fun TerminalWithAccessibility(
                                 }
 
                                 if (event.changes.all { !it.pressed }) break
-                                change.consume()
+                                // Only consume pointer changes when we're actually using them.
+                                // Consuming for HorizontalSwipe or Undetermined would block the
+                                // parent (e.g. RN drawer's PanGestureHandler) from receiving the
+                                // touches it needs to follow the finger.
+                                if (gestureType == GestureType.Scroll ||
+                                    gestureType == GestureType.Selection ||
+                                    gestureType == GestureType.HandleDrag
+                                ) {
+                                    change.consume()
+                                }
                             }
                         } finally {
                             isUserScrolling = false
@@ -1210,6 +1321,7 @@ internal fun TerminalWithAccessibility(
                         // 6. Gesture ended - cleanup
                         gestureEnded = true
                         longPressJob?.cancel()
+                        val gestureDurMs = android.os.SystemClock.uptimeMillis() - down.uptimeMillis
 
                         when (gestureType) {
                             GestureType.Scroll -> {
@@ -1236,30 +1348,30 @@ internal fun TerminalWithAccessibility(
                                 }
                             }
 
+                            GestureType.HorizontalSwipe -> {
+                                // The parent container (e.g. RN drawer) handles the swipe.
+                                // Nothing to do here.
+                            }
+
                             GestureType.Undetermined -> {
-                                // This is a tap. If a selection is active, clear it.
-                                // Otherwise, check for hyperlink or forward the tap.
                                 if (selectionManager.mode != SelectionMode.NONE) {
                                     selectionManager.clearSelection()
-                                } else {
-                                    // Check if tap is on a hyperlink
-                                    val tapCol = (down.position.x / baseCharWidth).toInt()
-                                        .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val tapRow = (down.position.y / baseCharHeight).toInt()
-                                        .coerceIn(0, screenState.snapshot.rows - 1)
-                                    val line = screenState.getVisibleLine(tapRow)
-                                    val hyperlinkUrl = line.getHyperlinkUrlAt(tapCol, terminalEmulator.autoDetectUrls)
+                                }
+                                val tapCol = (down.position.x / baseCharWidth).toInt()
+                                    .coerceIn(0, screenState.snapshot.cols - 1)
+                                val tapRow = (down.position.y / baseCharHeight).toInt()
+                                    .coerceIn(0, screenState.snapshot.rows - 1)
+                                val line = screenState.getVisibleLine(tapRow)
+                                val hyperlinkUrl = line.getHyperlinkUrlAt(tapCol, terminalEmulator.autoDetectUrls)
 
-                                    if (hyperlinkUrl != null) {
-                                        // User tapped on a hyperlink
-                                        currentOnHyperlinkClick(hyperlinkUrl)
+                                if (hyperlinkUrl != null) {
+                                    currentOnHyperlinkClick(hyperlinkUrl)
+                                } else {
+                                    if (keyboardEnabled) {
+                                        focusRequester.requestFocus()
                                     } else {
-                                        // Request focus when terminal is tapped to show keyboard
-                                        if (keyboardEnabled) {
-                                            focusRequester.requestFocus()
-                                        }
-                                        currentOnTerminalTap()
                                     }
+                                    currentOnTerminalTap()
                                 }
                                 // Record tap for double-tap detection
                                 tapTracker.lastTimestamp = down.uptimeMillis
@@ -1461,7 +1573,22 @@ internal fun TerminalWithAccessibility(
                             onClick = {
                                 val selectedText =
                                     selectionManager.getSelectedText(screenState.snapshot, screenState.scrollbackPosition)
-                                clipboardManager.setText(AnnotatedString(selectedText))
+                                // Compose's LocalClipboardManager.setText still exists but is
+                                // deprecated in favor of LocalClipboard (suspend API) in newer
+                                // Compose versions. To insulate against any silent no-op, also
+                                // set the system clipboard directly via Android's API.
+                                try {
+                                    clipboardManager.setText(AnnotatedString(selectedText))
+                                } catch (e: Throwable) {
+                                }
+                                try {
+                                    val androidCm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? AndroidClipboardManager
+                                    if (androidCm == null) {
+                                    } else {
+                                        androidCm.setPrimaryClip(ClipData.newPlainText("terminal_selection", selectedText))
+                                    }
+                                } catch (e: Throwable) {
+                                }
                                 selectionManager.clearSelection()
                             },
                             modifier = Modifier.size(COPY_BUTTON_SIZE),
@@ -1471,7 +1598,34 @@ internal fun TerminalWithAccessibility(
                             Text(stringResource(R.string.terminal_selection_copy), style = MaterialTheme.typography.labelSmall)
                         }
 
-                        Box {
+                        if (simpleSelectionToolbar) {
+                            // Slim two-button toolbar (Copy + Paste). Paste reads the
+                            // system clipboard via Android's ClipboardManager (Compose's
+                            // LocalClipboardManager only exposes read via the new suspend
+                            // API on LocalClipboard, which we are not using yet) and
+                            // dispatches to the emulator's `paste()` so bracketed-paste
+                            // mode is honoured when the remote shell has it on.
+                            FloatingActionButton(
+                                onClick = {
+                                    val androidCm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? AndroidClipboardManager
+                                    val pasteText = androidCm?.primaryClip
+                                        ?.takeIf { it.itemCount > 0 }
+                                        ?.getItemAt(0)
+                                        ?.coerceToText(context)
+                                        ?.toString()
+                                        .orEmpty()
+                                    selectionManager.clearSelection()
+                                    if (pasteText.isNotEmpty()) {
+                                        terminalEmulator.paste(pasteText)
+                                    }
+                                },
+                                modifier = Modifier.size(COPY_BUTTON_SIZE),
+                                containerColor = Color.White,
+                                contentColor = Color.Black,
+                            ) {
+                                Text(stringResource(R.string.terminal_selection_paste), style = MaterialTheme.typography.labelSmall)
+                            }
+                        } else Box {
                             val moreOptionsLabel = stringResource(R.string.terminal_selection_more_options_description)
                             FloatingActionButton(
                                 onClick = {
