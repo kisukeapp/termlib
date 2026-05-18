@@ -266,7 +266,14 @@ dokka {
 
 mavenPublishing {
     publishToMavenCentral(automaticRelease = true, validateDeployment = DeploymentValidation.PUBLISHED)
-    signAllPublications()
+    // Only sign when GPG creds are present in env — upstream needs this for
+    // Maven Central, but our fork publishes to GitHub Packages from CI without
+    // a signing key and `signAllPublications()` would register .asc artifacts
+    // the publish task then fails to find. The vanniktech in-memory signing
+    // plugin reads `ORG_GRADLE_PROJECT_signingInMemoryKey`, so gate on that.
+    if (System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey") != null) {
+        signAllPublications()
+    }
 
     coordinates(groupId = "org.connectbot", artifactId = "termlib")
 
