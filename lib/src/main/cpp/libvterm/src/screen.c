@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef __ANDROID__
+#  include <android/log.h>
+#endif
+
 #include "rect.h"
 #include "utf8.h"
 
@@ -749,10 +753,27 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       new_cursor.col = new_cols-1;
   }
 
-  /* We really expect the cursor position to be set by now */
+  /* Cursor should be set by now. If reflow tracking missed it (e.g. cursor
+   * sits in a blank continuation block whose inner copy loop never visited
+   * the cursor's row), fall back to clamping the original cursor into the
+   * new screen bounds. Warn but do not abort — a momentary cursor jump is
+   * far preferable to crashing the host process.
+   */
   if(active && (new_cursor.row == -1 || new_cursor.col == -1)) {
-    fprintf(stderr, "screen_resize failed to update cursor position\n");
-    abort();
+    fprintf(stderr,
+        "screen_resize: cursor tracking missed (old=%d,%d size=%dx%d->%dx%d), clamping\n",
+        old_cursor.col, old_cursor.row, old_cols, old_rows, new_cols, new_rows);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_WARN, "vterm",
+        "screen_resize: cursor tracking missed (old=%d,%d size=%dx%d->%dx%d), clamping",
+        old_cursor.col, old_cursor.row, old_cols, old_rows, new_cols, new_rows);
+#endif
+    new_cursor.row = old_cursor.row;
+    if(new_cursor.row < 0)              new_cursor.row = 0;
+    else if(new_cursor.row >= new_rows) new_cursor.row = new_rows - 1;
+    new_cursor.col = old_cursor.col;
+    if(new_cursor.col < 0)              new_cursor.col = 0;
+    else if(new_cursor.col >= new_cols) new_cursor.col = new_cols - 1;
   }
 
   if(old_row >= 0 && bufidx == BUFIDX_PRIMARY) {
