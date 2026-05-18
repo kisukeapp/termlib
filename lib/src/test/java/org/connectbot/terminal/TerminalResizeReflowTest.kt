@@ -2283,11 +2283,11 @@ class TerminalResizeReflowTest {
 
         val snapshot = emulator.getSnapshot()
         val selectionManager = SelectionManager()
-        selectionManager.startSelection(0, 0, SelectionMode.LINE)
+        selectionManager.startSelection(row = 0, col = 0, cols = snapshot.cols, mode = SelectionMode.LINE)
         selectionManager.updateSelection(1, 0)
         selectionManager.endSelection()
 
-        val copied = selectionManager.getSelectedText(snapshot, topLineIndex = 0)
+        val copied = selectionManager.getSelectedText(snapshot, scrollbackPosition = 0)
         assertEquals("ABC\nDEF", copied)
     }
 

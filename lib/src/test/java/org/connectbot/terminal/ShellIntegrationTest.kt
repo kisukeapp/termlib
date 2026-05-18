@@ -1,16 +1,30 @@
 package org.connectbot.terminal
 
+import androidx.compose.ui.graphics.Color
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class ShellIntegrationTest {
+
+    /**
+     * Get a stable snapshot after writing input to the emulator.
+     * Drains the main looper to ensure any handler-posted processPendingUpdates()
+     * completes before the test's own call, avoiding a race condition where the
+     * handler consumes pending state before the test can process it.
+     */
+    private fun getSnapshot(impl: TerminalEmulatorImpl): TerminalSnapshot {
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        impl.processPendingUpdates()
+        return impl.snapshot.value
+    }
 
     // OSC 8 escape sequence helpers
     private fun osc8Start(url: String, id: String? = null): String {
@@ -19,11 +33,12 @@ class ShellIntegrationTest {
     }
 
     private fun osc8End(): String = "\u001B]8;;\u001B\\"
+
     @Test
     fun testOsc133PromptMarker() = runBlocking {
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Send OSC 133;A (prompt start)
@@ -38,18 +53,14 @@ class ShellIntegrationTest {
 
         // Verify the line is marked as PROMPT
 
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
         val promptLine = snapshot.lines.firstOrNull { it.hasPrompt() }
 
         assertNotNull("Expected a line marked as PROMPT", promptLine)
 
         // Verify specific segment
-        val segments = promptLine!!.semanticSegments
+        val segments = promptLine!!.getSegmentsOfType(SemanticType.PROMPT)
         assertEquals(1, segments.size)
-        assertEquals(SemanticType.PROMPT, segments[0].semanticType)
         assertEquals(0, segments[0].startCol)
         assertEquals(promptText.length, segments[0].endCol)
     }
@@ -58,17 +69,14 @@ class ShellIntegrationTest {
     fun testOsc133CommandFinished() = runBlocking {
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Send OSC 133;D;42 (command finished with exit code 42)
         emulator.writeInput("\u001B]133;D;42\u001B\\".toByteArray())
 
         // Verify metadata contains exit code
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
         val finishedLine = snapshot.lines.firstOrNull {
             it.getSegmentsOfType(SemanticType.COMMAND_FINISHED).isNotEmpty()
         }
@@ -83,17 +91,14 @@ class ShellIntegrationTest {
     fun testOsc1337Annotation() = runBlocking {
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Send OSC 1337;AddAnnotation=Hello World
         val annotationMsg = "Hello World"
         emulator.writeInput("\u001B]1337;AddAnnotation=$annotationMsg\u001B\\".toByteArray())
         // Verify annotation
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
         val annotatedLine = snapshot.lines.firstOrNull {
             it.getSegmentsOfType(SemanticType.ANNOTATION).isNotEmpty()
         }
@@ -105,10 +110,28 @@ class ShellIntegrationTest {
     }
 
     @Test
+    fun testBoldBlackUsesBrightPaletteForIndexedColor() = runBlocking {
+        val emulator = TerminalEmulatorFactory.create(
+            initialRows = 5,
+            initialCols = 20,
+        )
+
+        // Kismet uses indexed black on black plus bold, expecting xterm-style
+        // "bold as bright" behavior so the foreground becomes bright black.
+        emulator.writeInput("\u001B[38;5;0m\u001B[48;5;0m\u001B[1mX".toByteArray())
+
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
+        val cell = snapshot.lines[0].cells[0]
+
+        assertEquals(Color.Black, cell.bgColor)
+        assertNotEquals("Bold black should promote to bright black", cell.bgColor, cell.fgColor)
+    }
+
+    @Test
     fun testOsc8BasicHyperlink() = runBlocking {
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Print: "Click [here](https://example.com) for info"
@@ -118,10 +141,7 @@ class ShellIntegrationTest {
 
         emulator.writeInput(input.toByteArray())
 
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
 
         // Hyperlink should be on row 0
         val hyperlinkSegments = snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK)
@@ -129,7 +149,7 @@ class ShellIntegrationTest {
 
         val segment = hyperlinkSegments[0]
         assertEquals(url, segment.metadata)
-        assertEquals(6, segment.startCol)  // "Click " is 6 chars
+        assertEquals(6, segment.startCol) // "Click " is 6 chars
         assertEquals(6 + linkText.length, segment.endCol)
 
         // Other rows should have no hyperlinks
@@ -143,7 +163,7 @@ class ShellIntegrationTest {
     fun testOsc8MultipleHyperlinksOnDifferentLines() = runBlocking {
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Simulate output like test_osc8.sh:
@@ -171,21 +191,18 @@ class ShellIntegrationTest {
         impl.writeInput("\r\nEnd of test\r\n".toByteArray())
         impl.processPendingUpdates()
 
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator)
 
         // Row 0: No hyperlinks (just header text)
         assertTrue(
             "Row 0 should have no hyperlinks",
-            snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Row 1: Empty line, no hyperlinks
         assertTrue(
             "Row 1 should have no hyperlinks",
-            snapshot.lines[1].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[1].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Row 2: Google hyperlink
@@ -201,20 +218,20 @@ class ShellIntegrationTest {
         // Row 4: Empty line, no hyperlinks
         assertTrue(
             "Row 4 should have no hyperlinks",
-            snapshot.lines[4].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[4].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Row 5: "End of test", no hyperlinks
         assertTrue(
             "Row 5 should have no hyperlinks",
-            snapshot.lines[5].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[5].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Remaining rows should also have no hyperlinks
         for (row in 6 until snapshot.lines.size) {
             assertTrue(
                 "Row $row should have no hyperlinks",
-                snapshot.lines[row].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+                snapshot.lines[row].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
             )
         }
     }
@@ -224,7 +241,7 @@ class ShellIntegrationTest {
         // Use a small terminal (5 rows) to force scrolling
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 5,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Output 7 lines to force scrolling (2 lines will scroll off)
@@ -260,10 +277,7 @@ class ShellIntegrationTest {
         impl.writeInput("${osc8Start("https://link3.com")}Link3${osc8End()}\r\n".toByteArray())
         impl.processPendingUpdates()
 
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator)
 
         // After scrolling (7 lines, 5 rows = 3 scrolls), visible lines should be:
         // Row 0: "Plain text" (was line 3) - no hyperlink
@@ -276,7 +290,7 @@ class ShellIntegrationTest {
         // Row 0 should have no hyperlinks (plain text)
         assertTrue(
             "Row 0 should have no hyperlinks (plain text)",
-            snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Row 1 should have Link2
@@ -287,7 +301,7 @@ class ShellIntegrationTest {
         // Row 2 should have no hyperlinks (more text)
         assertTrue(
             "Row 2 should have no hyperlinks",
-            snapshot.lines[2].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[2].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
 
         // Row 3 should have Link3
@@ -298,7 +312,7 @@ class ShellIntegrationTest {
         // Row 4 should have no hyperlinks (empty after cursor)
         assertTrue(
             "Row 4 should have no hyperlinks (empty)",
-            snapshot.lines[4].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty()
+            snapshot.lines[4].getSegmentsOfType(SemanticType.HYPERLINK).isEmpty(),
         )
     }
 
@@ -308,7 +322,7 @@ class ShellIntegrationTest {
         // even though they were printed on a different line
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 10,
-            initialCols = 40
+            initialCols = 40,
         )
 
         // Print hyperlink on row 0, then move to row 5 and print plain text
@@ -324,10 +338,7 @@ class ShellIntegrationTest {
 
         emulator.writeInput(input.toByteArray())
 
-        val snapshot = (emulator as TerminalEmulatorImpl).let {
-            it.processPendingUpdates()
-            it.snapshot.value
-        }
+        val snapshot = getSnapshot(emulator as TerminalEmulatorImpl)
 
         // Only row 0 should have the hyperlink
         val row0Segments = snapshot.lines[0].getSegmentsOfType(SemanticType.HYPERLINK)
@@ -339,7 +350,7 @@ class ShellIntegrationTest {
             val segments = snapshot.lines[row].getSegmentsOfType(SemanticType.HYPERLINK)
             assertTrue(
                 "Row $row should have no hyperlinks but has ${segments.size}",
-                segments.isEmpty()
+                segments.isEmpty(),
             )
         }
     }

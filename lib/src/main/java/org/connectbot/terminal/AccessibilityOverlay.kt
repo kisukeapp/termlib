@@ -20,24 +20,31 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.buildAnnotatedString
-import kotlinx.coroutines.launch
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.text
-import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.buildAnnotatedString
+import kotlinx.coroutines.launch
 
 /**
  * Invisible overlay that provides semantic structure for screen readers.
@@ -60,15 +67,20 @@ internal fun AccessibilityOverlay(
     lazyListState: LazyListState = rememberLazyListState(),
     modifier: Modifier = Modifier,
     onToggleReviewMode: () -> Unit = {},
-    isReviewMode: Boolean = false
+    isReviewMode: Boolean = false,
 ) {
     val density = LocalDensity.current
-    val snapshot = screenState.snapshot
     val clipboardManager = LocalClipboardManager.current
     val coroutineScope = rememberCoroutineScope()
 
+    // State for live region announcements (replaces deprecated announceForAccessibility)
+    val announcementText = remember { mutableStateOf("") }
+    val announcementCounter = remember { mutableIntStateOf(0) }
+
     // Include both scrollback and visible lines in the list
-    val allLines = snapshot.scrollback + snapshot.lines
+    val allLines by remember(screenState) {
+        derivedStateOf { screenState.snapshot.scrollback + screenState.snapshot.lines }
+    }
 
     // Sync LazyColumn scroll with terminal scrollback position
     LaunchedEffect(screenState.scrollbackPosition) {
@@ -76,21 +88,36 @@ internal fun AccessibilityOverlay(
             // Convert scrollbackPosition to LazyColumn index
             // scrollbackPosition = 0 means bottom (index = scrollback.size)
             // scrollbackPosition = scrollback.size means top (index = 0)
-            val targetIndex = snapshot.scrollback.size - screenState.scrollbackPosition
+            val targetIndex = screenState.snapshot.scrollback.size - screenState.scrollbackPosition
             if (targetIndex >= 0 && targetIndex < allLines.size) {
                 lazyListState.scrollToItem(targetIndex)
             }
         }
     }
 
+    // Hidden live region for TalkBack announcements.
+    // When announcementCounter changes, TalkBack reads the updated contentDescription.
+    // This replaces the deprecated View.announceForAccessibility().
+    val counter = announcementCounter.intValue
+    if (counter > 0) {
+        Box(
+            modifier = Modifier
+                .height(with(density) { 0.toDp() })
+                .semantics {
+                    contentDescription = announcementText.value
+                    liveRegion = LiveRegionMode.Polite
+                },
+        )
+    }
+
     LazyColumn(
         state = lazyListState,
         modifier = modifier,
-        userScrollEnabled = false
+        userScrollEnabled = false,
     ) {
         items(
             count = allLines.size,
-            key = { index -> allLines[index].row to allLines[index].lastModified }
+            key = { index -> allLines[index].row to allLines[index].lastModified },
         ) { index ->
             val line = allLines[index]
 
@@ -109,13 +136,14 @@ internal fun AccessibilityOverlay(
                             Modifier.background(Color(0x1A4CAF50))
                         } else {
                             Modifier
-                        }
+                        },
                     )
                     .semantics {
                         // Use text property for granular navigation (words/characters)
                         // Only use contentDescription for semantic segments
                         if (line.semanticSegments.isEmpty() ||
-                            line.semanticSegments.all { it.semanticType == SemanticType.DEFAULT }) {
+                            line.semanticSegments.all { it.semanticType == SemanticType.DEFAULT }
+                        ) {
                             // Plain text - use text property for granular navigation
                             text = AnnotatedString(line.text)
                         } else {
@@ -126,10 +154,26 @@ internal fun AccessibilityOverlay(
                         // Custom accessibility actions
                         customActions = buildList {
                             // Copy Line
-                            add(CustomAccessibilityAction("Copy Line") {
-                                clipboardManager.setText(buildAnnotatedString { append(line.text) })
-                                true
-                            })
+                            add(
+                                CustomAccessibilityAction("Copy Line") {
+                                    clipboardManager.setText(buildAnnotatedString { append(line.text) })
+                                    true
+                                },
+                            )
+
+                            // Read Last Output
+                            add(
+                                CustomAccessibilityAction("Read Last Output") {
+                                    val outputText = getLastCommandOutput(allLines)
+                                    if (outputText != null) {
+                                        announcementText.value = outputText
+                                        announcementCounter.intValue++
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                            )
 
                             // Toggle Review Mode
                             // TODO(Terminal): Figure out how to make Review Mode work better
@@ -139,56 +183,62 @@ internal fun AccessibilityOverlay(
 //                            })
 
                             // Jump to Next Prompt
-                            add(CustomAccessibilityAction("Jump to Next Prompt") {
-                                coroutineScope.launch {
-                                    val nextPromptIndex = findNextLineWithSegmentType(
-                                        allLines,
-                                        currentIndex = index,
-                                        semanticType = SemanticType.PROMPT,
-                                        forward = true
-                                    )
-                                    if (nextPromptIndex != -1) {
-                                        lazyListState.animateScrollToItem(nextPromptIndex)
-                                    }
-                                }
-                                true
-                            })
-
-                            // Jump to Previous Prompt
-                            add(CustomAccessibilityAction("Jump to Previous Prompt") {
-                                coroutineScope.launch {
-                                    val prevPromptIndex = findNextLineWithSegmentType(
-                                        allLines,
-                                        currentIndex = index,
-                                        semanticType = SemanticType.PROMPT,
-                                        forward = false
-                                    )
-                                    if (prevPromptIndex != -1) {
-                                        lazyListState.animateScrollToItem(prevPromptIndex)
-                                    }
-                                }
-                                true
-                            })
-
-                            // Jump to Next Command Output (if applicable)
-                            if (line.getSegmentsOfType(SemanticType.COMMAND_OUTPUT).isNotEmpty()) {
-                                add(CustomAccessibilityAction("Jump to Next Output") {
+                            add(
+                                CustomAccessibilityAction("Jump to Next Prompt") {
                                     coroutineScope.launch {
-                                        val nextOutputIndex = findNextLineWithSegmentType(
+                                        val nextPromptIndex = findNextLineWithSegmentType(
                                             allLines,
                                             currentIndex = index,
-                                            semanticType = SemanticType.COMMAND_OUTPUT,
-                                            forward = true
+                                            semanticType = SemanticType.PROMPT,
+                                            forward = true,
                                         )
-                                        if (nextOutputIndex != -1) {
-                                            lazyListState.animateScrollToItem(nextOutputIndex)
+                                        if (nextPromptIndex != -1) {
+                                            lazyListState.animateScrollToItem(nextPromptIndex)
                                         }
                                     }
                                     true
-                                })
+                                },
+                            )
+
+                            // Jump to Previous Prompt
+                            add(
+                                CustomAccessibilityAction("Jump to Previous Prompt") {
+                                    coroutineScope.launch {
+                                        val prevPromptIndex = findNextLineWithSegmentType(
+                                            allLines,
+                                            currentIndex = index,
+                                            semanticType = SemanticType.PROMPT,
+                                            forward = false,
+                                        )
+                                        if (prevPromptIndex != -1) {
+                                            lazyListState.animateScrollToItem(prevPromptIndex)
+                                        }
+                                    }
+                                    true
+                                },
+                            )
+
+                            // Jump to Next Command Output (if applicable)
+                            if (line.getSegmentsOfType(SemanticType.COMMAND_OUTPUT).isNotEmpty()) {
+                                add(
+                                    CustomAccessibilityAction("Jump to Next Output") {
+                                        coroutineScope.launch {
+                                            val nextOutputIndex = findNextLineWithSegmentType(
+                                                allLines,
+                                                currentIndex = index,
+                                                semanticType = SemanticType.COMMAND_OUTPUT,
+                                                forward = true,
+                                            )
+                                            if (nextOutputIndex != -1) {
+                                                lazyListState.animateScrollToItem(nextOutputIndex)
+                                            }
+                                        }
+                                        true
+                                    },
+                                )
                             }
                         }
-                    }
+                    },
             )
         }
     }
@@ -201,76 +251,80 @@ internal fun AccessibilityOverlay(
  * @param line The terminal line to annotate
  * @return AnnotatedString with semantic annotations
  */
-private fun buildSemanticAnnotatedString(line: TerminalLine): AnnotatedString {
-    return buildAnnotatedString {
-        var lastEndCol = 0
+private fun buildSemanticAnnotatedString(line: TerminalLine): AnnotatedString = buildAnnotatedString {
+    var lastEndCol = 0
 
-        for (segment in line.semanticSegments.sortedBy { it.startCol }) {
-            // Add any gap text before this segment
-            if (segment.startCol > lastEndCol) {
-                val gapText = line.text.substring(
-                    lastEndCol,
-                    segment.startCol.coerceAtMost(line.text.length)
-                )
-                append(gapText)
-            }
-
-            // Get text for this segment
-            val segmentText = line.text.substring(
+    for (segment in line.semanticSegments.sortedBy { it.startCol }) {
+        // Add any gap text before this segment
+        if (segment.startCol > lastEndCol) {
+            val gapText = line.text.substring(
+                lastEndCol,
                 segment.startCol.coerceAtMost(line.text.length),
-                segment.endCol.coerceAtMost(line.text.length)
             )
-
-            // Append text with semantic annotation
-            when (segment.semanticType) {
-                SemanticType.PROMPT -> {
-                    append("Prompt: ")
-                    append(segmentText)
-                }
-                SemanticType.COMMAND_INPUT -> {
-                    append("Command: ")
-                    append(segmentText)
-                }
-                SemanticType.COMMAND_OUTPUT -> {
-                    append("Output: ")
-                    append(segmentText)
-                }
-                SemanticType.COMMAND_FINISHED -> {
-                    val exitCode = segment.metadata
-                    if (exitCode != null) {
-                        append("Command finished with exit code $exitCode")
-                    } else {
-                        append("Command finished")
-                    }
-                }
-                SemanticType.ANNOTATION -> {
-                    append("Annotation: ")
-                    append(segmentText)
-                }
-                SemanticType.HYPERLINK -> {
-                    append("Link: ")
-                    append(segmentText)
-                    val url = segment.metadata
-                    if (url != null) {
-                        append(", URL: ")
-                        append(url)
-                    }
-                }
-                SemanticType.DEFAULT -> append(segmentText)
-            }
-
-            if (segment != line.semanticSegments.last()) {
-                append(" ")
-            }
-
-            lastEndCol = segment.endCol
+            append(gapText)
         }
 
-        // Add any remaining text after last segment
-        if (lastEndCol < line.text.length) {
-            val remainingText = line.text.substring(lastEndCol)
-            append(remainingText)
+        // Get text for this segment
+        val segmentText = line.text.substring(
+            segment.startCol.coerceAtMost(line.text.length),
+            segment.endCol.coerceAtMost(line.text.length),
+        )
+
+        // Append text with semantic annotation
+        when (segment.semanticType) {
+            SemanticType.PROMPT -> {
+                append("Prompt: ")
+                append(segmentText)
+            }
+
+            SemanticType.COMMAND_INPUT -> {
+                append("Command: ")
+                append(segmentText)
+            }
+
+            SemanticType.COMMAND_OUTPUT -> {
+                append("Output: ")
+                append(segmentText)
+            }
+
+            SemanticType.COMMAND_FINISHED -> {
+                val exitCode = segment.metadata
+                if (exitCode != null) {
+                    append("Command finished with exit code $exitCode")
+                } else {
+                    append("Command finished")
+                }
+            }
+
+            SemanticType.ANNOTATION -> {
+                append("Annotation: ")
+                append(segmentText)
+            }
+
+            SemanticType.HYPERLINK -> {
+                append("Link: ")
+                append(segmentText)
+                val url = segment.metadata
+                if (url != null) {
+                    append(", URL: ")
+                    append(url)
+                }
+            }
+
+            SemanticType.DEFAULT -> append(segmentText)
         }
+
+        if (segment != line.semanticSegments.last()) {
+            append(" ")
+        }
+
+        lastEndCol = segment.endCol
+    }
+
+    // Add any remaining text after last segment
+    if (lastEndCol < line.text.length) {
+        val remainingText = line.text.substring(lastEndCol)
+        append(remainingText)
     }
 }
 
@@ -303,7 +357,7 @@ private fun buildSemanticDescription(line: TerminalLine): String {
             if (segment.startCol > lastEndCol) {
                 val gapText = line.text.substring(
                     lastEndCol,
-                    segment.startCol.coerceAtMost(line.text.length)
+                    segment.startCol.coerceAtMost(line.text.length),
                 )
                 if (gapText.isNotBlank()) {
                     append(gapText)
@@ -313,14 +367,17 @@ private fun buildSemanticDescription(line: TerminalLine): String {
             // Get text for this segment
             val segmentText = line.text.substring(
                 segment.startCol.coerceAtMost(line.text.length),
-                segment.endCol.coerceAtMost(line.text.length)
+                segment.endCol.coerceAtMost(line.text.length),
             )
 
             // Add semantic prefix for non-DEFAULT segments
             when (segment.semanticType) {
                 SemanticType.PROMPT -> append("Prompt: ")
+
                 SemanticType.COMMAND_INPUT -> append("Command: ")
+
                 SemanticType.COMMAND_OUTPUT -> append("Output: ")
+
                 SemanticType.COMMAND_FINISHED -> {
                     val exitCode = segment.metadata
                     if (exitCode != null) {
@@ -329,8 +386,11 @@ private fun buildSemanticDescription(line: TerminalLine): String {
                         append("Command finished: ")
                     }
                 }
+
                 SemanticType.ANNOTATION -> append("Annotation: ")
+
                 SemanticType.HYPERLINK -> append("Link: ")
+
                 SemanticType.DEFAULT -> { /* No prefix */ }
             }
 
@@ -361,6 +421,56 @@ private fun buildSemanticDescription(line: TerminalLine): String {
 }
 
 /**
+ * Extract the text output of the last completed command.
+ *
+ * Uses OSC 133 semantic segments to find the boundaries of the most recent
+ * command output. Scans backward through the lines to find the latest
+ * [SemanticType.COMMAND_FINISHED] marker, then locates the corresponding
+ * [SemanticType.COMMAND_INPUT] segment (matched by promptId) to determine
+ * where the output begins.
+ *
+ * @param lines All terminal lines (scrollback + visible)
+ * @return The command output text, or null if no completed command is found
+ */
+internal fun getLastCommandOutput(lines: List<TerminalLine>): String? {
+    // Find the most recent COMMAND_FINISHED marker
+    var finishedIndex = -1
+    var finishedPromptId = -1
+    for (i in lines.indices.reversed()) {
+        val segments = lines[i].getSegmentsOfType(SemanticType.COMMAND_FINISHED)
+        if (segments.isNotEmpty()) {
+            finishedIndex = i
+            finishedPromptId = segments.first().promptId
+            break
+        }
+    }
+    if (finishedIndex < 0) return null
+
+    // Find the COMMAND_INPUT line with the same promptId
+    var inputIndex = -1
+    for (i in (0 until finishedIndex).reversed()) {
+        val segments = lines[i].getSegmentsOfType(SemanticType.COMMAND_INPUT)
+        if (segments.any { it.promptId == finishedPromptId }) {
+            inputIndex = i
+            break
+        }
+    }
+    if (inputIndex < 0) return null
+
+    // Output is between the command input line (exclusive) and the finished marker line (exclusive)
+    val outputStart = inputIndex + 1
+    val outputEnd = finishedIndex - 1
+    if (outputStart > outputEnd) return null
+
+    val outputText = (outputStart..outputEnd)
+        .map { lines[it].text.trimEnd() }
+        .joinToString("\n")
+        .trimEnd()
+
+    return outputText.ifEmpty { null }
+}
+
+/**
  * Find the next line containing a specific semantic type.
  *
  * @param lines List of all terminal lines (scrollback + visible)
@@ -373,7 +483,7 @@ private fun findNextLineWithSegmentType(
     lines: List<TerminalLine>,
     currentIndex: Int,
     semanticType: SemanticType,
-    forward: Boolean
+    forward: Boolean,
 ): Int {
     val range = if (forward) {
         (currentIndex + 1 until lines.size)

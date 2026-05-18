@@ -1,14 +1,67 @@
+import com.android.build.api.artifact.SingleArtifact
+import com.vanniktech.maven.publish.DeploymentValidation
+import org.jetbrains.dokka.gradle.formats.DokkaFormatPlugin
+import org.jetbrains.dokka.gradle.internal.InternalDokkaGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     id("kotlin-parcelize")
-    alias(libs.plugins.spotless)
+    alias(libs.plugins.roborazzi)
+    alias(libs.plugins.publish)
     alias(libs.plugins.metalava)
     alias(libs.plugins.dokka)
+    alias(libs.plugins.kover)
+    alias(libs.plugins.sonarqube)
     `maven-publish`
+}
+
+@OptIn(InternalDokkaGradlePluginApi::class)
+abstract class DokkaMarkdownPlugin : DokkaFormatPlugin(formatName = "markdown") {
+    override fun DokkaFormatPlugin.DokkaFormatPluginContext.configure() {
+        project.dependencies {
+            dokkaPlugin(dokka("gfm-plugin"))
+            formatDependencies.dokkaPublicationPluginClasspathApiOnly.dependencies.addLater(
+                dokka("gfm-template-processing-plugin"),
+            )
+        }
+    }
+}
+
+apply<DokkaMarkdownPlugin>()
+
+val hostJniDir = layout.buildDirectory.dir("host-jni")
+val cppSourceDir = layout.projectDirectory.dir("src/main/cpp")
+
+val cmakeConfigureHost by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Configure the CMake host build of jni_cb_term"
+    inputs.dir(cppSourceDir)
+    outputs.dir(hostJniDir)
+    commandLine(
+        "cmake",
+        "-S",
+        cppSourceDir.asFile.absolutePath,
+        "-B",
+        hostJniDir.get().asFile.absolutePath,
+        "-DCMAKE_BUILD_TYPE=Debug",
+    )
+}
+
+val cmakeBuildHost by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Build libjni_cb_term for the host JVM"
+    dependsOn(cmakeConfigureHost)
+    inputs.dir(hostJniDir)
+    commandLine(
+        "cmake",
+        "--build",
+        hostJniDir.get().asFile.absolutePath,
+        "--target",
+        "jni_cb_term",
+    )
+    outputs.dir(hostJniDir)
 }
 
 android {
@@ -32,6 +85,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            enableAndroidTestCoverage = true
+        }
+
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -62,52 +119,70 @@ android {
             keepDebugSymbols.add("**/*.so")
         }
     }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            all { testTask ->
+                testTask.dependsOn(cmakeBuildHost)
+                testTask.jvmArgs("-Djava.library.path=${hostJniDir.get().asFile.absolutePath}")
+            }
+        }
+    }
+}
+
+val sonarJavaBinaries = objects.fileCollection()
+val sonarJavaTestBinaries = objects.fileCollection()
+val sonarAndroidLintReportPaths = objects.fileCollection()
+
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.configureJavaCompileTask { javaCompile ->
+            sonarJavaBinaries.from(javaCompile.destinationDirectory)
+        }
+        variant.hostTests["unitTest"]?.configureJavaCompileTask { javaCompile ->
+            sonarJavaTestBinaries.from(javaCompile.destinationDirectory)
+        }
+        variant.androidTest?.configureJavaCompileTask { javaCompile ->
+            sonarJavaTestBinaries.from(javaCompile.destinationDirectory)
+        }
+        sonarAndroidLintReportPaths.from(variant.artifacts.get(SingleArtifact.LINT_XML_REPORT))
+    }
+}
+
+kover {
+    reports {
+        filters {
+            excludes {
+                // Build config
+                classes("*.BuildConfig")
+            }
+        }
+    }
+}
+
+sonar {
+    properties {
+        property("sonar.projectName", "ConnectBot Terminal")
+        property("sonar.projectKey", "connectbot_termlib")
+        property("sonar.organization", "connectbot")
+        property("sonar.host.url", "https://sonarcloud.io")
+        property(
+            "sonar.coverage.jacoco.xmlReportPaths",
+            listOf(
+                "build/reports/kover/reportDebug.xml",
+                "build/reports/coverage/androidTest/debug/connected/report.xml",
+            ),
+        )
+        property("sonar.java.binaries", sonarJavaBinaries)
+        property("sonar.java.test.binaries", sonarJavaTestBinaries)
+        property("sonar.androidLint.reportPaths", sonarAndroidLintReportPaths)
+    }
 }
 
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
-    }
-}
-
-spotless {
-    java {
-        target(
-            fileTree(".") {
-                include("**/*.java")
-                exclude("**/build", "**/out")
-            },
-        )
-        removeUnusedImports()
-        trimTrailingWhitespace()
-
-        replaceRegex("class-level javadoc indentation fix", "^\\*", " *")
-        replaceRegex("method-level javadoc indentation fix", "\t\\*", "\t *")
-    }
-
-    kotlinGradle {
-        target(
-            fileTree(".") {
-                include("**/*.gradle.kts")
-                exclude("**/build", "**/out")
-            },
-        )
-        ktlint()
-    }
-
-    format("xml") {
-        target(
-            fileTree(".") {
-                include("config/**/*.xml", "lib/**/*.xml", "test-app/**/*.xml")
-                exclude("**/build", "**/out")
-            },
-        )
-    }
-
-    format("misc") {
-        target("**/.gitignore")
-        trimTrailingWhitespace()
-        endWithNewline()
     }
 }
 
@@ -127,12 +202,17 @@ dependencies {
 
     // Testing
     testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.test.ext.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(composeBom)
-    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.roborazzi.compose)
+    testImplementation(composeBom)
+    testImplementation(libs.androidx.compose.ui.test.junit4)
+    testImplementation(libs.mockk)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
+
+roborazzi {
+    outputDir.set(file("src/test/roborazzi"))
 }
 
 afterEvaluate {
@@ -177,6 +257,42 @@ dokka {
     }
 
     pluginsConfiguration {
-        html.footerMessage.set("Copyright Kenny Root")
+        html {
+            footerMessage.set("Copyright Kenny Root")
+            templatesDir.set(file("dokka/templates"))
+        }
+    }
+}
+
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true, validateDeployment = DeploymentValidation.PUBLISHED)
+    signAllPublications()
+
+    coordinates(groupId = "org.connectbot", artifactId = "termlib")
+
+    pom {
+        name.set("termlib")
+        description.set("ConnectBot's terminal emulator Android Compose component using libvterm")
+        inceptionYear.set("2025")
+        url.set(gitHubUrl)
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("kruton")
+                name.set("Kenny Root")
+                url.set("https://github.com/kruton/")
+            }
+        }
+        scm {
+            connection.set("scm:git:$gitHubUrl.git")
+            developerConnection.set("$gitHubUrl.git")
+            url.set(gitHubUrl)
+        }
     }
 }

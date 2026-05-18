@@ -1,33 +1,39 @@
 [versions]
-androidGradlePlugin = "8.12.0"
-kotlin = "2.1.0"
-spotless = "8.2.1"
+androidGradlePlugin = "9.2.1"
+kotlin = "2.3.21"
+spotless = "8.4.0"
 publish = "0.36.0"
 release = "3.1.0"
-metalava = "0.4.0-alpha03"
-dokka = "2.2.0-Beta"
+metalava = "0.5.0"
+dokka = "2.2.0"
+sonarqube = "7.3.0.8198"
+kover = "0.9.8"
 
-composeBom = "2024.02.00"
+composeBom = "2026.05.00"
 lifecycleViewModel = "2.10.0"
-activityCompose = "1.12.3"
+activityCompose = "1.13.0"
+composeRuntime = "1.11.1"
+foundation = "1.11.1"
 
 appcompat = "1.7.1"
-material = "1.13.0"
-coreKtx = "1.17.0"
+material = "1.14.0"
+coreKtx = "1.18.0"
 
-espresso = "3.7.0"
-junit = "1.3.0"
+mockk = "1.14.9"
 
 junitClassic = "4.13.2"
+robolectric = "4.16.1"
+roborazzi = "1.60.0"
+ui = "1.11.1"
 
 [libraries]
 androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
 material = { module = "com.google.android.material:material", version.ref = "material" }
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
-androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "junit" }
-androidx-espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso" }
-
 junit = { module = "junit:junit", version.ref = "junitClassic" }
+mockk = { module = "io.mockk:mockk", version.ref = "mockk" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+roborazzi-compose = { module = "io.github.takahirom.roborazzi:roborazzi-compose", version.ref = "roborazzi" }
 
 androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
 androidx-compose-ui = { module = "androidx.compose.ui:ui" }
@@ -37,12 +43,12 @@ androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling
 androidx-compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
 androidx-compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
-androidx-compose-runtime = { module = "androidx.compose.runtime:runtime" }
-androidx-compose-foundation = { module = "androidx.compose.foundation:foundation" }
+androidx-compose-runtime = { module = "androidx.compose.runtime:runtime", version.ref = "composeRuntime" }
+androidx-compose-foundation = { module = "androidx.compose.foundation:foundation", version.ref = "foundation" }
 androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycleViewModel" }
 
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
-androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui = { group = "androidx.compose.ui", name = "ui", version.ref = "ui" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "androidGradlePlugin" }
@@ -54,3 +60,6 @@ publish = { id = "com.vanniktech.maven.publish", version.ref = "publish" }
 release = { id = "net.researchgate.release", version.ref = "release" }
 metalava = { id = "me.tylerbwong.gradle.metalava", version.ref = "metalava" }
 dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
+roborazzi = { id = "io.github.takahirom.roborazzi", version.ref = "roborazzi" }
+sonarqube = { id = "org.sonarqube", version.ref = "sonarqube" }
+kover = { id = "org.jetbrains.kotlinx.kover", version.ref = "kover" }

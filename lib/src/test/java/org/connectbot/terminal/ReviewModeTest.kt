@@ -17,7 +17,7 @@
 package org.connectbot.terminal
 
 import androidx.compose.ui.test.ExperimentalTestApi
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 // import androidx.compose.ui.test.performCustomAccessibilityActionWithLabel
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -40,7 +40,7 @@ class ReviewModeTest {
         runBlocking {
             val emulator = TerminalEmulatorFactory.create(
                 initialRows = 5,
-                initialCols = 20
+                initialCols = 20,
             )
 
             emulator.writeInput("Test Line\r\n".toByteArray())
@@ -50,7 +50,7 @@ class ReviewModeTest {
                 TerminalWithAccessibility(
                     terminalEmulator = emulator,
                     keyboardEnabled = true,
-                    forceAccessibilityEnabled = true
+                    forceAccessibilityEnabled = true,
                 )
             }
 
@@ -74,14 +74,14 @@ class ReviewModeTest {
         runBlocking {
             val emulator = TerminalEmulatorFactory.create(
                 initialRows = 10,
-                initialCols = 40
+                initialCols = 40,
             )
 
             composeTestRule.setContent {
                 TerminalWithAccessibility(
                     terminalEmulator = emulator,
                     keyboardEnabled = true,
-                    forceAccessibilityEnabled = true
+                    forceAccessibilityEnabled = true,
                 )
             }
 
@@ -103,14 +103,14 @@ class ReviewModeTest {
         runBlocking {
             val emulator = TerminalEmulatorFactory.create(
                 initialRows = 5,
-                initialCols = 20
+                initialCols = 20,
             )
 
             composeTestRule.setContent {
                 TerminalWithAccessibility(
                     terminalEmulator = emulator,
                     keyboardEnabled = true,
-                    forceAccessibilityEnabled = true
+                    forceAccessibilityEnabled = true,
                 )
             }
 
@@ -124,7 +124,7 @@ class ReviewModeTest {
         runBlocking {
             val emulator = TerminalEmulatorFactory.create(
                 initialRows = 10,
-                initialCols = 40
+                initialCols = 40,
             )
 
             // Create a history
@@ -137,7 +137,7 @@ class ReviewModeTest {
                 TerminalWithAccessibility(
                     terminalEmulator = emulator,
                     keyboardEnabled = true,
-                    forceAccessibilityEnabled = true
+                    forceAccessibilityEnabled = true,
                 )
             }
 

@@ -17,8 +17,8 @@
 package org.connectbot.terminal
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,7 +40,7 @@ import androidx.compose.runtime.setValue
  */
 @Stable
 internal class TerminalScreenState(
-    initialSnapshot: TerminalSnapshot
+    initialSnapshot: TerminalSnapshot,
 ) {
     /**
      * The current immutable terminal snapshot.
@@ -67,22 +67,20 @@ internal class TerminalScreenState(
      * @param index Line index (0 = oldest scrollback, totalLines-1 = last visible line)
      * @return The terminal line at the specified index
      */
-    fun getLine(index: Int): TerminalLine {
-        return if (index < snapshot.scrollback.size) {
-            snapshot.scrollback[index]
+    fun getLine(index: Int): TerminalLine = if (index < snapshot.scrollback.size) {
+        snapshot.scrollback[index]
+    } else {
+        val screenIndex = index - snapshot.scrollback.size
+        if (screenIndex in snapshot.lines.indices) {
+            snapshot.lines[screenIndex]
         } else {
-            val screenIndex = index - snapshot.scrollback.size
-            if (screenIndex in snapshot.lines.indices) {
-                snapshot.lines[screenIndex]
-            } else {
-                // Return empty line if index out of bounds
-                TerminalLine.empty(
-                    row = screenIndex,
-                    cols = snapshot.cols,
-                    defaultFg = androidx.compose.ui.graphics.Color.White,
-                    defaultBg = androidx.compose.ui.graphics.Color.Black
-                )
-            }
+            // Return empty line if index out of bounds
+            TerminalLine.empty(
+                row = screenIndex,
+                cols = snapshot.cols,
+                defaultFg = androidx.compose.ui.graphics.Color.White,
+                defaultBg = androidx.compose.ui.graphics.Color.Black,
+            )
         }
     }
 
@@ -106,7 +104,7 @@ internal class TerminalScreenState(
                 row = row,
                 cols = snapshot.cols,
                 defaultFg = androidx.compose.ui.graphics.Color.White,
-                defaultBg = androidx.compose.ui.graphics.Color.Black
+                defaultBg = androidx.compose.ui.graphics.Color.Black,
             )
         }
     }
@@ -141,14 +139,25 @@ internal class TerminalScreenState(
 
     /**
      * Update the snapshot while preserving UI state (scroll position).
-     * This allows the terminal content to update without resetting the scroll position.
+     *
+     * When a user is scrolled up reading history and new content arrives (or a
+     * resize / reconnect changes the scrollback size), the content at their
+     * current viewport must stay visible. That requires adjusting
+     * [scrollbackPosition] by the delta between old and new scrollback sizes —
+     * otherwise the visible lines shift with each update.
+     *
+     * A user already at the bottom ([scrollbackPosition] == 0) stays at the
+     * bottom by definition and needs no adjustment.
      *
      * @param newSnapshot The new snapshot to use
      */
     internal fun updateSnapshot(newSnapshot: TerminalSnapshot) {
+        val oldScrollbackSize = snapshot.scrollback.size
+        val newScrollbackSize = newSnapshot.scrollback.size
         snapshot = newSnapshot
-        if (scrollbackPosition > newSnapshot.scrollback.size) {
-            scrollbackPosition = newSnapshot.scrollback.size
+        if (scrollbackPosition != 0) {
+            val delta = newScrollbackSize - oldScrollbackSize
+            scrollbackPosition = (scrollbackPosition + delta).coerceIn(0, newScrollbackSize)
         }
     }
 }
@@ -164,19 +173,21 @@ internal class TerminalScreenState(
  */
 @Composable
 internal fun rememberTerminalScreenState(
-    terminalEmulator: TerminalEmulatorImpl
+    terminalEmulator: TerminalEmulatorImpl,
 ): TerminalScreenState {
-    val snapshot by remember(terminalEmulator) {
-        terminalEmulator.snapshot
-    }.collectAsState()
-
-    // Create state instance once per emulator, but update its snapshot when it changes
+    // Create state instance once per emulator, using the current value as initial
     val state = remember(terminalEmulator) {
-        TerminalScreenState(snapshot)
+        TerminalScreenState(terminalEmulator.snapshot.value)
     }
 
-    // Update the snapshot without recreating the state object (preserves scrollbackPosition)
-    state.updateSnapshot(snapshot)
+    // Collecting in a LaunchedEffect keeps this adapter composable stable instead of
+    // recomposing it because of Flow collection in this function. Updates to
+    // state.snapshot still invalidate/recompose any composables that read it.
+    LaunchedEffect(terminalEmulator) {
+        terminalEmulator.snapshot.collect { newSnapshot ->
+            state.updateSnapshot(newSnapshot)
+        }
+    }
 
     return state
 }

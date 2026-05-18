@@ -21,6 +21,30 @@
 #include <vterm.h>
 #include <memory>
 #include <mutex>
+#include <string>
+
+template<typename T>
+class ScopedLocalRef {
+public:
+    ScopedLocalRef(JNIEnv* env, T ref) : mEnv(env), mRef(ref) {}
+    ~ScopedLocalRef() { if (mRef) mEnv->DeleteLocalRef(mRef); }
+    T get() const { return mRef; }
+    operator T() const { return mRef; }
+    ScopedLocalRef(ScopedLocalRef&& other) noexcept : mEnv(other.mEnv), mRef(other.mRef) {
+        other.mRef = nullptr;
+    }
+    ScopedLocalRef(const ScopedLocalRef&) = delete;
+    ScopedLocalRef& operator=(ScopedLocalRef&& other) noexcept {
+        if (mRef) mEnv->DeleteLocalRef(mRef);
+        mEnv = other.mEnv;
+        mRef = other.mRef;
+        other.mRef = nullptr;
+        return *this;
+    }
+private:
+    JNIEnv* mEnv;
+    T mRef;
+};
 
 class Terminal {
 public:
@@ -52,7 +76,7 @@ public:
     // Cell data retrieval for rendering
     int getCellRun(JNIEnv* env, int row, int col, jobject runObject);
 
-    // Line info queries
+    // Line info retrieval (for continuation/soft-wrap detection)
     bool getLineContinuation(int row);
     void setLineContinuation(int row, bool continuation);
 
@@ -60,8 +84,12 @@ public:
     int setPaletteColors(const uint32_t* colors, int count);
     int setDefaultColors(uint32_t fgColor, uint32_t bgColor);
 
+    // Terminal behavior options
+    int setBoldHighbright(int enabled);
+
 private:
-    // libvterm screen callbacks (called by libvterm)
+    // libvterm screen callbacks (called by libvterm while mLock may be held).
+    // Implementations must not synchronously call back into Terminal methods.
     static int termDamage(VTermRect rect, void* user);
     static int termMoverect(VTermRect dest, VTermRect src, void* user);
     static int termMovecursor(VTermPos pos, VTermPos oldpos, int visible, void* user);
@@ -69,11 +97,13 @@ private:
     static int termBell(void* user);
     static int termSbPushline(int cols, const VTermScreenCell* cells, int continuation, void* user);
     static int termSbPopline(int cols, VTermScreenCell* cells, int *continuation, void* user);
+    static int termSbClear(void* user);
 
     // libvterm output callback (keyboard generates this)
     static void termOutput(const char* s, size_t len, void* user);
 
-    // libvterm state fallback for OSC sequences
+    // libvterm state fallback for OSC sequences. Same no-synchronous-reentry
+    // rule as screen callbacks.
     static int termOscFallback(int command, VTermStringFragment frag, void* user);
 
     // libvterm state fallback for CSI sequences (mode 2026, mode 2048)
@@ -87,7 +117,8 @@ private:
     // libvterm state fallback for APC sequences (Kitty graphics)
     static int termApcFallback(VTermStringFragment frag, void* user);
 
-    // libvterm selection callbacks for OSC 52 clipboard
+    // libvterm selection callbacks for OSC 52 clipboard. Same no-synchronous-
+    // reentry rule as screen callbacks.
     static int termSelectionSet(VTermSelectionMask mask, VTermStringFragment frag, void* user);
     static int termSelectionQuery(VTermSelectionMask mask, void* user);
 
@@ -99,6 +130,7 @@ private:
     void invokeBell();
     void invokePushScrollbackLine(int cols, const VTermScreenCell* cells, int continuation);
     int invokePopScrollbackLine(int cols, VTermScreenCell* cells, int *continuation);
+    void invokeClearScrollback();
     void invokeKeyboardOutput(const char* data, size_t len);
     int invokeOscSequence(int command, const std::string& payload, int cursorRow, int cursorCol);
     void invokeSyncOutputChanged(bool active);
@@ -152,6 +184,7 @@ private:
     jmethodID mBellMethod;
     jmethodID mPushScrollbackMethod;
     jmethodID mPopScrollbackMethod;
+    jmethodID mClearScrollbackMethod;
     jmethodID mKeyboardInputMethod;
     jmethodID mOscSequenceMethod;
     jmethodID mSyncOutputChangedMethod;
@@ -200,8 +233,10 @@ private:
     jclass mTerminalPropertyColorClass;
     jmethodID mTerminalPropertyColorConstructor;
 
-    // Thread safety (recursive mutex for reentrant calls via callbacks)
-    mutable std::recursive_mutex mLock;
+    // Thread safety. Native entrypoints are serialized by this non-recursive
+    // mutex. Java callbacks invoked from libvterm must not synchronously call
+    // back into Terminal methods; post/defer any work that needs native state.
+    mutable std::mutex mLock;
 };
 
 #endif // TERMSCREEN_TERMINAL_H
