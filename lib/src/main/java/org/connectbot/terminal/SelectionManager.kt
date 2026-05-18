@@ -319,11 +319,28 @@ internal class SelectionManager {
         }
     }
 
-    private fun getSnapshotLine(snapshot: TerminalSnapshot, row: Int, scrollbackPosition: Int = 0): TerminalLine? = if (scrollbackPosition > 0) {
-        val scrollbackIndex = snapshot.scrollback.size - scrollbackPosition + row
-        snapshot.scrollback.getOrNull(scrollbackIndex)
-    } else {
-        snapshot.lines.getOrNull(row)
+    /**
+     * Resolve a visible-viewport row index (0 = top of currently-rendered
+     * screen) to the line that's actually displayed at that row. Mirrors
+     * `TerminalScreenState.getVisibleLine` so selection-text extraction and
+     * selection-highlight rendering agree on which line a row refers to.
+     *
+     * When [scrollbackPosition] is 0 the viewport shows the live screen, so
+     * row R maps to `snapshot.lines[R]`. When scrolled back N lines the
+     * viewport starts at scrollback row `scrollback.size - N` and may span
+     * into `snapshot.lines` along the bottom.
+     */
+    private fun getSnapshotLine(snapshot: TerminalSnapshot, row: Int, scrollbackPosition: Int = 0): TerminalLine? {
+        val absIdx = if (scrollbackPosition > 0) {
+            snapshot.scrollback.size - scrollbackPosition + row
+        } else {
+            snapshot.scrollback.size + row
+        }
+        return if (absIdx < snapshot.scrollback.size) {
+            snapshot.scrollback.getOrNull(absIdx)
+        } else {
+            snapshot.lines.getOrNull(absIdx - snapshot.scrollback.size)
+        }
     }
 
     private fun isWordChar(char: Char): Boolean = char.isLetterOrDigit() || char == '_'
@@ -372,16 +389,14 @@ internal class SelectionManager {
 
         val minRow = minOf(range.startRow, range.endRow)
         val maxRow = maxOf(range.startRow, range.endRow)
-        val totalLines = snapshot.scrollback.size + snapshot.lines.size
 
-        fun lineAt(absRow: Int): TerminalLine? {
-            val idx = (scrollbackPosition + absRow).coerceIn(0, totalLines - 1)
-            return if (idx < snapshot.scrollback.size) {
-                snapshot.scrollback[idx]
-            } else {
-                snapshot.lines.getOrNull(idx - snapshot.scrollback.size)
-            }
-        }
+        // selectionRange stores visible-viewport row indices (the same coords
+        // the gesture loop computes from `down.position.y / baseCharHeight`).
+        // Earlier this method had its own row-resolver that mis-treated those
+        // indices as absolute scrollback offsets, so extracted text came from
+        // a totally different line than the one the user saw highlighted.
+        // Delegate to the canonical helper so highlight + extraction agree.
+        fun lineAt(row: Int): TerminalLine? = getSnapshotLine(snapshot, row, scrollbackPosition)
 
         // The line.continuation flag (libvterm's VTermLineInfo.continuation semantics) is
         // true if THIS line continues from the previous one. So the boundary between row
